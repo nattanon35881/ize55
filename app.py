@@ -1,10 +1,9 @@
-import logging
 import os
+import logging
 
+from flask import Flask, request, jsonify
 import requests
 import yfinance as yf
-from flask import Flask, jsonify, request
-
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -18,7 +17,7 @@ TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 def send_message(chat_id, text):
     """Send a message back to a Telegram chat."""
     try:
-        response = requests.post(
+        requests.post(
             f"{TELEGRAM_API}/sendMessage",
             json={
                 "chat_id": chat_id,
@@ -28,7 +27,6 @@ def send_message(chat_id, text):
             },
             timeout=10,
         )
-        response.raise_for_status()
     except Exception:
         logger.exception("send_message failed")
 
@@ -52,25 +50,28 @@ def fmt_pct(value, digits=2):
 
 
 def resolve_ticker(raw_symbol):
-    """Try the symbol as typed, then with a .BK suffix for Thai stocks."""
+    """Try the symbol as typed, then with a .BK suffix (SET/Thai stocks).
+    Returns (yfinance.Ticker, resolved_symbol, info_dict) or (None, None, None)
+    if nothing usable was found.
+    """
     candidates = [raw_symbol]
     if "." not in raw_symbol:
         candidates.append(f"{raw_symbol}.BK")
 
     for candidate in candidates:
         try:
-            ticker = yf.Ticker(candidate)
-            info = ticker.info
+            t = yf.Ticker(candidate)
+            info = t.info
         except Exception:
             continue
         price = info.get("currentPrice") or info.get("regularMarketPrice")
         if price:
-            return ticker, candidate, info
+            return t, candidate, info
     return None, None, None
 
 
 def get_news(ticker, limit=3):
-    """Handle both old and new yfinance news response shapes."""
+    """Handle both old and new yfinance .news response shapes defensively."""
     try:
         raw_items = ticker.news or []
     except Exception:
@@ -80,12 +81,105 @@ def get_news(ticker, limit=3):
     for raw in raw_items[:limit]:
         content = raw.get("content", raw)
         title = content.get("title") or raw.get("title")
+        link = None
         click = content.get("clickThroughUrl") or content.get("canonicalUrl")
-        link = click.get("url") if isinstance(click, dict) else click
+        if isinstance(click, dict):
+            link = click.get("url")
         link = link or raw.get("link")
         if title and link:
             items.append((title, link))
     return items
+
+
+def _get_row(df, names):
+    """Return the first matching row (as a Series) from a yfinance financial
+    statement DataFrame, trying several possible label spellings."""
+    for name in names:
+        if name in df.index:
+            return df.loc[name]
+    return None
+
+
+def get_fcf_series(ticker):
+    """Return [(year_label, free_cash_flow), ...] oldest-to-newest using
+    real historical data from yfinance's annual cash flow statement."""
+    try:
+        cf = ticker.cashflow
+    except Exception:
+        return []
+    if cf is None or cf.empty:
+        return []
+
+    fcf_row = _get_row(cf, ["Free Cash Flow"])
+    if fcf_row is None:
+        ocf_row = _get_row(cf, ["Operating Cash Flow", "Total Cash From Operating Activities"])
+        capex_row = _get_row(cf, ["Capital Expenditure", "Capital Expenditures"])
+        if ocf_row is None or capex_row is None:
+            return []
+        # CapEx is reported as a negative (cash outflow), so adding it
+        # subtracts it from operating cash flow correctly.
+        fcf_row = ocf_row.add(capex_row, fill_value=0)
+
+    pairs = [(col, val) for col, val in fcf_row.items() if val == val]  # drop NaN
+    pairs.sort(key=lambda p: p[0])  # oldest -> newest
+    return [(str(getattr(d, "year", d)), float(v)) for d, v in pairs]
+
+
+def estimate_growth_rate(fcf_series, default=0.05, min_rate=0.0, max_rate=0.15):
+    """CAGR of historical FCF, capped to a sane range so it can never run away."""
+    positive = [v for _, v in fcf_series if v and v > 0]
+    if len(positive) < 2:
+        return default
+    years = len(positive) - 1
+    if years <= 0 or positive[0] <= 0:
+        return default
+    try:
+        cagr = (positive[-1] / positive[0]) ** (1 / years) - 1
+    except Exception:
+        return default
+    return max(min_rate, min(max_rate, cagr))
+
+
+def estimate_discount_rate(beta, risk_free=0.04, erp=0.05, min_rate=0.06, max_rate=0.15):
+    """CAPM-based discount rate from the stock's actual beta, capped to a sane range."""
+    b = beta if beta else 1.0
+    r = risk_free + b * erp
+    return max(min_rate, min(max_rate, r))
+
+
+def compute_dcf_value(ticker, info, years=5, terminal_growth=0.025):
+    """2-stage DCF using real FCF history and a CAPM discount rate.
+    Growth and terminal-growth rates are always kept below the discount
+    rate so the terminal-value formula can never blow up or go negative
+    (this was the bug in the original spreadsheet).
+    Returns (intrinsic_value_per_share, r, g1, g_term) or None.
+    """
+    fcf_series = get_fcf_series(ticker)
+    if not fcf_series:
+        return None
+    latest_fcf = fcf_series[-1][1]
+    if not latest_fcf or latest_fcf <= 0:
+        return None
+
+    shares = info.get("sharesOutstanding")
+    if not shares:
+        return None
+
+    r = estimate_discount_rate(info.get("beta"))
+    g1 = min(estimate_growth_rate(fcf_series), r - 0.01)
+    g_term = min(terminal_growth, r - 0.01)
+
+    pv_sum = 0.0
+    fcf_t = latest_fcf
+    for t in range(1, years + 1):
+        fcf_t *= (1 + g1)
+        pv_sum += fcf_t / ((1 + r) ** t)
+
+    terminal_value = fcf_t * (1 + g_term) / (r - g_term)
+    pv_terminal = terminal_value / ((1 + r) ** years)
+
+    intrinsic_per_share = (pv_sum + pv_terminal) / shares
+    return intrinsic_per_share, r, g1, g_term
 
 
 def build_report(raw_symbol):
@@ -104,17 +198,19 @@ def build_report(raw_symbol):
     name = info.get("longName") or info.get("shortName") or resolved
     price = info.get("currentPrice") or info.get("regularMarketPrice")
     currency = info.get("currency", "")
-    previous_close = info.get("previousClose")
+    prev_close = info.get("previousClose")
     change_pct = None
-    if price is not None and previous_close:
-        change_pct = (price - previous_close) / previous_close
+    if price and prev_close:
+        change_pct = (price - prev_close) / prev_close
 
     lines = [f"<b>{name} ({resolved})</b>"]
+
     price_line = f"ราคา: {fmt_num(price)} {currency}".strip()
     if change_pct is not None:
         arrow = "🟢" if change_pct >= 0 else "🔴"
         price_line += f"  {arrow} {fmt_pct(change_pct)}"
     lines.append(price_line)
+
     lines.append(
         "P/E: {} | P/B: {} | EPS: {}".format(
             fmt_num(info.get("trailingPE")),
@@ -138,6 +234,27 @@ def build_report(raw_symbol):
     if market_cap:
         lines.append(f"Market Cap: {fmt_num(market_cap, digits=0)}")
 
+    dcf_result = None
+    try:
+        dcf_result = compute_dcf_value(ticker, info)
+    except Exception:
+        logger.exception("DCF calculation failed for %s", resolved)
+
+    if dcf_result:
+        intrinsic, r, g1, g_term = dcf_result
+        dcf_line = f"\n💰 มูลค่าที่แท้จริงโดยประมาณ (DCF 5 ปี): {fmt_num(intrinsic)} {currency}"
+        if price:
+            diff_pct = (intrinsic - price) / price
+            verdict = "ต่ำกว่าราคาตลาด" if diff_pct > 0 else "สูงกว่าราคาตลาด"
+            dcf_line += f"\n   ต่างจากราคาปัจจุบัน {fmt_pct(diff_pct)} ({verdict})"
+        dcf_line += (
+            f"\n   <i>สมมติฐาน: growth {fmt_pct(g1)}/ปี, "
+            f"discount rate {fmt_pct(r)}, terminal growth {fmt_pct(g_term)}</i>"
+        )
+        lines.append(dcf_line)
+    else:
+        lines.append("\n💰 คำนวณ DCF ไม่ได้ — ข้อมูลกระแสเงินสด/จำนวนหุ้นไม่พอสำหรับหุ้นตัวนี้")
+
     news_items = get_news(ticker)
     if news_items:
         lines.append("\n📰 ข่าวล่าสุด:")
@@ -145,11 +262,13 @@ def build_report(raw_symbol):
             lines.append(f'• <a href="{link}">{title}</a>')
     else:
         lines.append("\n📰 ไม่พบข่าวล่าสุดในระบบตอนนี้")
+
     return "\n".join(lines)
 
 
 @app.route("/", methods=["GET"])
 def health():
+    # Render (and similar hosts) ping this so the service is marked healthy.
     return "OK", 200
 
 
