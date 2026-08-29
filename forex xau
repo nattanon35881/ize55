@@ -4,35 +4,82 @@ import yfinance as yf
 
 logger = logging.getLogger(__name__)
 
-# Try these tickers in order — Yahoo Finance sometimes serves gold data
-# under one symbol but not the other depending on region/availability.
-GOLD_TICKER_CANDIDATES = ["GC=F", "XAUUSD=X"]
+# Known symbol aliases -> yfinance ticker candidates to try, in order.
+SYMBOL_ALIASES = {
+    "XAUUSD": ["GC=F", "XAUUSD=X"],
+    "GOLD": ["GC=F", "XAUUSD=X"],
+    "XAGUSD": ["SI=F", "XAGUSD=X"],
+    "SILVER": ["SI=F", "XAGUSD=X"],
+    "US100": ["^NDX", "NQ=F"],
+    "NAS100": ["^NDX", "NQ=F"],
+    "US30": ["^DJI", "YM=F"],
+    "DJ30": ["^DJI", "YM=F"],
+    "US500": ["^GSPC", "ES=F"],
+    "SPX500": ["^GSPC", "ES=F"],
+    "SPX": ["^GSPC", "ES=F"],
+    "BTCUSD": ["BTC-USD"],
+    "ETHUSD": ["ETH-USD"],
+    "USOIL": ["CL=F"],
+    "WTI": ["CL=F"],
+    "UKOIL": ["BZ=F"],
+    "BRENT": ["BZ=F"],
+}
+
+# Major currency codes, so a typed pair like "EURUSD" or "GBPJPY" can be
+# turned into the yfinance format "EURUSD=X" automatically.
+CURRENCY_CODES = {
+    "USD", "EUR", "GBP", "JPY", "AUD", "NZD", "CAD", "CHF", "CNH", "SGD", "HKD", "THB",
+}
 
 
-def _get_gold_history(interval="4h", period="1mo"):
-    """Try each candidate gold ticker until one returns usable data."""
-    for symbol in GOLD_TICKER_CANDIDATES:
+def resolve_forex_symbol(raw_symbol):
+    """Return a list of yfinance ticker candidates for a symbol the user
+    typed (e.g. 'XAUUSD', 'US100', 'EURUSD'), or [] if it isn't a
+    recognized forex/index/commodity symbol."""
+    symbol = raw_symbol.strip().upper()
+    if symbol in SYMBOL_ALIASES:
+        return SYMBOL_ALIASES[symbol]
+    if len(symbol) == 6 and symbol[:3] in CURRENCY_CODES and symbol[3:] in CURRENCY_CODES:
+        return [f"{symbol}=X"]
+    return []
+
+
+def _get_4h_history(ticker_candidates, period="1mo"):
+    """Try each candidate ticker. Yahoo Finance has no native 4H interval,
+    so real 4H candles are built here by fetching 1H candles and
+    resampling them (Open=first, High=max, Low=min, Close=last).
+    Note: bins align to UTC clock hours, which may sit slightly off from
+    your broker/MT4's own 4H candle boundaries — close enough for the
+    bias reading, but worth knowing if you're eyeballing it against a chart.
+    """
+    for symbol in ticker_candidates:
         try:
-            hist = yf.Ticker(symbol).history(period=period, interval=interval)
+            hourly = yf.Ticker(symbol).history(period=period, interval="1h")
         except Exception:
             continue
-        if hist is not None and not hist.empty:
-            return symbol, hist
+        if hourly is None or hourly.empty:
+            continue
+        try:
+            four_hour = (
+                hourly.resample("4h")
+                .agg({"Open": "first", "High": "max", "Low": "min", "Close": "last"})
+                .dropna()
+            )
+        except Exception:
+            continue
+        if four_hour.empty:
+            continue
+        return symbol, four_hour
     return None, None
 
 
-def compute_4h_bias(lookback_candles=30):
-    """Replicates step 1 of the user's system: take the most recent swing
-    (lowest low to highest high) on the 4H chart, draw a 0/50/100
-    Fibonacci range across it, and read the bias the same way the sheet
-    does — upper half of the range = 'expensive' (SELL bias), lower half
-    = 'cheap' (BUY bias).
-
-    lookback_candles controls how far back "the latest swing" looks —
-    30 x 4H candles is roughly the last week of trading. Adjust if the
-    user's own chart reading tends to use a different window.
+def compute_4h_bias(ticker_candidates, lookback_candles=30):
+    """Take the most recent swing (lowest low to highest high) on the 4H
+    chart, draw a 0/50/100 Fibonacci range across it, and read the bias
+    the same way the user's system does: upper half = 'expensive' (SELL
+    bias), lower half = 'cheap' (BUY bias).
     """
-    symbol, hist = _get_gold_history()
+    symbol, hist = _get_4h_history(ticker_candidates)
     if hist is None:
         return None
 
@@ -47,11 +94,7 @@ def compute_4h_bias(lookback_candles=30):
 
     current_price = float(hist["Close"].iloc[-1])
     fib_50 = (swing_low + swing_high) / 2
-
-    if current_price > fib_50:
-        bias = "SELL (โซนแพง)"
-    else:
-        bias = "BUY (โซนถูก)"
+    bias = "SELL (โซนแพง)" if current_price > fib_50 else "BUY (โซนถูก)"
 
     return {
         "symbol": symbol,
@@ -63,25 +106,36 @@ def compute_4h_bias(lookback_candles=30):
     }
 
 
-def build_forex_alert_message():
-    """Build the scheduled Telegram alert: an automated 4H bias reading,
-    plus a checklist reminder for the parts of the system (order blocks,
-    IDM, Turtle Soup, etc.) that need the user's own visual confirmation.
-    """
+CHECKLIST = (
+    "✅ <b>เช็คลิสต์ที่เหลือ (ดูด้วยตาตามระบบ):</b>\n"
+    "1️⃣ 1H หาแนวรับ/แนวต้าน (Resistance, Support, RBS, SBR, OCL, QM, OB)\n"
+    "2️⃣ กรองโซนใหญ่→เล็ก 1H &gt; M15 &gt; M5\n"
+    "3️⃣ เช็คว่ามี IDM ก่อนถึงโซนหรือยัง\n"
+    "4️⃣ ครบทุกเงื่อนไข = setup A+\n"
+    "5️⃣ TP 3 จุด (800-1000 จุด / swing BSL-SSL / price movement TF ใหญ่สุด) — RR ≥ 1:6, SL 300 จุด\n"
+    "6️⃣ Confirm เข้าจริงเมื่อ M1/M5 เกิดสัญญาณ Turtle Soup (แท่งต่อแท่งเท่านั้น)"
+)
+
+
+def _build_report(display_symbol, title):
+    candidates = resolve_forex_symbol(display_symbol)
+    if not candidates:
+        return None  # not a recognized forex/index/commodity symbol
+
     try:
-        data = compute_4h_bias()
+        data = compute_4h_bias(candidates)
     except Exception:
-        logger.exception("compute_4h_bias failed")
+        logger.exception("compute_4h_bias failed for %s", display_symbol)
         data = None
 
     if not data:
         return (
-            "⚠️ ดึงข้อมูลราคาทอง (XAUUSD) ไม่ได้ตอนนี้ "
+            f"⚠️ ดึงข้อมูลราคา {display_symbol} ไม่ได้ตอนนี้ "
             "ลองเปิดชาร์ตเช็คด้วยตัวเองก่อนนะครับ"
         )
 
     lines = [
-        "🔔 <b>เช็คระบบ ize — ทองคำ (XAUUSD)</b>",
+        f"<b>{title} — {display_symbol}</b>",
         f"ราคาปัจจุบัน: {data['price']:,.2f}",
         "",
         f"📊 <b>Bias จาก Fibo 4H:</b> {data['bias']}",
@@ -89,12 +143,20 @@ def build_forex_alert_message():
         f"   50%: {data['fib_50']:,.2f}",
         f"   100% (swing high): {data['swing_high']:,.2f}",
         "",
-        "✅ <b>เช็คลิสต์ที่เหลือ (ดูด้วยตาตามระบบ):</b>",
-        "1️⃣ 1H หาแนวรับ/แนวต้าน (Resistance, Support, RBS, SBR, OCL, QM, OB)",
-        "2️⃣ กรองโซนใหญ่→เล็ก 1H &gt; M15 &gt; M5",
-        "3️⃣ เช็คว่ามี IDM ก่อนถึงโซนหรือยัง",
-        "4️⃣ ครบทุกเงื่อนไข = setup A+",
-        "5️⃣ TP 3 จุด (800-1000 จุด / swing BSL-SSL / price movement TF ใหญ่สุด) — RR ≥ 1:6, SL 300 จุด",
-        "6️⃣ Confirm เข้าจริงเมื่อ M1/M5 เกิดสัญญาณ Turtle Soup (แท่งต่อแท่งเท่านั้น)",
+        CHECKLIST,
     ]
     return "\n".join(lines)
+
+
+def build_forex_alert_message(display_symbol="XAUUSD"):
+    """Scheduled alert (used by the /forex-check cron route)."""
+    return _build_report(display_symbol, "🔔 เช็คระบบ ize (ตามเวลา)") or (
+        f"⚠️ ดึงข้อมูลราคา {display_symbol} ไม่ได้ตอนนี้"
+    )
+
+
+def build_symbol_report(raw_symbol):
+    """On-demand report when the user types a symbol like XAUUSD or US100
+    directly into the chat. Returns None if the symbol isn't recognized
+    as forex/index/commodity, so the caller can fall back to stock lookup."""
+    return _build_report(raw_symbol.strip().upper(), "📊 เช็คราคาสด")
