@@ -5,6 +5,8 @@ from flask import Flask, request, jsonify
 import requests
 import yfinance as yf
 
+from forex import build_forex_alert_message, build_symbol_report, resolve_forex_symbol
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -12,6 +14,8 @@ app = Flask(__name__)
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
 TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
+FOREX_CHAT_ID = os.environ.get("FOREX_CHAT_ID", "")
+FOREX_CRON_SECRET = os.environ.get("FOREX_CRON_SECRET", "")
 
 
 def send_message(chat_id, text):
@@ -272,6 +276,18 @@ def health():
     return "OK", 200
 
 
+@app.route(f"/forex-check/{FOREX_CRON_SECRET}", methods=["GET", "POST"])
+def forex_check():
+    # Triggered by an external free cron service at the user's 5 scheduled
+    # check times (see README) — this route itself does not run a
+    # background scheduler, since Render's free tier can't keep one alive.
+    if not FOREX_CHAT_ID:
+        return jsonify(ok=False, error="FOREX_CHAT_ID is not set"), 400
+    message = build_forex_alert_message()
+    send_message(FOREX_CHAT_ID, message)
+    return jsonify(ok=True)
+
+
 @app.route(f"/webhook/{TELEGRAM_TOKEN}", methods=["POST"])
 def webhook():
     update = request.get_json(force=True, silent=True) or {}
@@ -287,12 +303,20 @@ def webhook():
     if text.startswith("/start") or text.startswith("/help"):
         send_message(
             chat_id,
-            "สวัสดีครับ 👋\nพิมพ์ชื่อย่อหุ้น เช่น PTT, ADVANC, AAPL, GOOGL "
-            "แล้วบอทจะตอบราคา ข่าวล่าสุด และพื้นฐานบริษัทให้ครับ",
+            "สวัสดีครับ 👋\n"
+            "พิมพ์ชื่อย่อหุ้น เช่น PTT, ADVANC, AAPL, GOOGL "
+            "แล้วบอทจะตอบราคา ข่าวล่าสุด และพื้นฐานบริษัทให้ครับ\n\n"
+            "หรือพิมพ์สัญลักษณ์ทอง/ดัชนี/คู่เงิน เช่น XAUUSD, US100, EURUSD "
+            "เพื่อเช็คราคาสดและ Bias จาก Fibo 4H ตามระบบ ize\n\n"
+            f"Chat ID ของคุณ (เอาไปตั้งค่าแจ้งเตือน Forex): <code>{chat_id}</code>",
         )
         return jsonify(ok=True)
 
-    report = build_report(text)
+    if resolve_forex_symbol(text):
+        report = build_symbol_report(text)
+    else:
+        report = build_report(text)
+
     if report:
         send_message(chat_id, report)
     return jsonify(ok=True)
