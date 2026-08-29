@@ -1,0 +1,100 @@
+import logging
+
+import yfinance as yf
+
+logger = logging.getLogger(__name__)
+
+# Try these tickers in order — Yahoo Finance sometimes serves gold data
+# under one symbol but not the other depending on region/availability.
+GOLD_TICKER_CANDIDATES = ["GC=F", "XAUUSD=X"]
+
+
+def _get_gold_history(interval="4h", period="1mo"):
+    """Try each candidate gold ticker until one returns usable data."""
+    for symbol in GOLD_TICKER_CANDIDATES:
+        try:
+            hist = yf.Ticker(symbol).history(period=period, interval=interval)
+        except Exception:
+            continue
+        if hist is not None and not hist.empty:
+            return symbol, hist
+    return None, None
+
+
+def compute_4h_bias(lookback_candles=30):
+    """Replicates step 1 of the user's system: take the most recent swing
+    (lowest low to highest high) on the 4H chart, draw a 0/50/100
+    Fibonacci range across it, and read the bias the same way the sheet
+    does — upper half of the range = 'expensive' (SELL bias), lower half
+    = 'cheap' (BUY bias).
+
+    lookback_candles controls how far back "the latest swing" looks —
+    30 x 4H candles is roughly the last week of trading. Adjust if the
+    user's own chart reading tends to use a different window.
+    """
+    symbol, hist = _get_gold_history()
+    if hist is None:
+        return None
+
+    window = hist.tail(lookback_candles)
+    if window.empty:
+        return None
+
+    swing_low = float(window["Low"].min())
+    swing_high = float(window["High"].max())
+    if swing_high <= swing_low:
+        return None
+
+    current_price = float(hist["Close"].iloc[-1])
+    fib_50 = (swing_low + swing_high) / 2
+
+    if current_price > fib_50:
+        bias = "SELL (โซนแพง)"
+    else:
+        bias = "BUY (โซนถูก)"
+
+    return {
+        "symbol": symbol,
+        "price": current_price,
+        "swing_low": swing_low,
+        "swing_high": swing_high,
+        "fib_50": fib_50,
+        "bias": bias,
+    }
+
+
+def build_forex_alert_message():
+    """Build the scheduled Telegram alert: an automated 4H bias reading,
+    plus a checklist reminder for the parts of the system (order blocks,
+    IDM, Turtle Soup, etc.) that need the user's own visual confirmation.
+    """
+    try:
+        data = compute_4h_bias()
+    except Exception:
+        logger.exception("compute_4h_bias failed")
+        data = None
+
+    if not data:
+        return (
+            "⚠️ ดึงข้อมูลราคาทอง (XAUUSD) ไม่ได้ตอนนี้ "
+            "ลองเปิดชาร์ตเช็คด้วยตัวเองก่อนนะครับ"
+        )
+
+    lines = [
+        "🔔 <b>เช็คระบบ ize — ทองคำ (XAUUSD)</b>",
+        f"ราคาปัจจุบัน: {data['price']:,.2f}",
+        "",
+        f"📊 <b>Bias จาก Fibo 4H:</b> {data['bias']}",
+        f"   0% (swing low): {data['swing_low']:,.2f}",
+        f"   50%: {data['fib_50']:,.2f}",
+        f"   100% (swing high): {data['swing_high']:,.2f}",
+        "",
+        "✅ <b>เช็คลิสต์ที่เหลือ (ดูด้วยตาตามระบบ):</b>",
+        "1️⃣ 1H หาแนวรับ/แนวต้าน (Resistance, Support, RBS, SBR, OCL, QM, OB)",
+        "2️⃣ กรองโซนใหญ่→เล็ก 1H &gt; M15 &gt; M5",
+        "3️⃣ เช็คว่ามี IDM ก่อนถึงโซนหรือยัง",
+        "4️⃣ ครบทุกเงื่อนไข = setup A+",
+        "5️⃣ TP 3 จุด (800-1000 จุด / swing BSL-SSL / price movement TF ใหญ่สุด) — RR ≥ 1:6, SL 300 จุด",
+        "6️⃣ Confirm เข้าจริงเมื่อ M1/M5 เกิดสัญญาณ Turtle Soup (แท่งต่อแท่งเท่านั้น)",
+    ]
+    return "\n".join(lines)
