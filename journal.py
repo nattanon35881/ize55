@@ -83,6 +83,14 @@ def get_open_trades_raw():
     return result.get("trades", [])
 
 
+def get_all_trades():
+    """Every trade (open + closed), for the dashboard."""
+    result = _call_sheet({"action": "all_trades"})
+    if not result or not result.get("ok"):
+        return None
+    return result.get("trades", [])
+
+
 def get_stats():
     result = _call_sheet({"action": "stats"})
     if not result or not result.get("ok"):
