@@ -74,6 +74,15 @@ def list_open_trades():
     return "\n".join(lines)
 
 
+def get_open_trades_raw():
+    """Same data as list_open_trades() but as a list of dicts, for
+    building inline-keyboard pickers instead of plain text."""
+    result = _call_sheet({"action": "list_open"})
+    if not result or not result.get("ok"):
+        return None
+    return result.get("trades", [])
+
+
 def get_stats():
     result = _call_sheet({"action": "stats"})
     if not result or not result.get("ok"):
@@ -91,106 +100,3 @@ def get_stats():
         f"Win rate: {win_rate:.1f}%\n"
         f"รวม: {total_r:+.2f}R"
     )
-// วางโค้ดนี้ใน Google Sheet ของคุณ: Extensions > Apps Script
-// แล้ว Deploy เป็น Web App (ดูขั้นตอนใน README.md)
-
-function doPost(e) {
-  var sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName("Trades");
-  if (!sheet) {
-    sheet = SpreadsheetApp.getActiveSpreadsheet().insertSheet("Trades");
-    sheet.appendRow(["ID", "Timestamp", "Side", "Symbol", "Entry", "SL", "TP", "Status", "ExitPrice", "ExitTime", "PnL_R", "Note"]);
-  }
-
-  var body = JSON.parse(e.postData.contents);
-  var action = body.action;
-
-  if (action === "log") {
-    var newId = getNextId(sheet);
-    sheet.appendRow([
-      newId,
-      new Date(),
-      body.side,
-      body.symbol,
-      body.entry,
-      body.sl,
-      body.tp,
-      "OPEN",
-      "", "", "",
-      body.note || "",
-    ]);
-    return jsonResponse({ ok: true, id: newId });
-  }
-
-  if (action === "close") {
-    var id = body.id;
-    var exitPrice = Number(body.exit_price);
-    var data = sheet.getDataRange().getValues();
-    for (var i = 1; i < data.length; i++) {
-      if (String(data[i][0]) === String(id)) {
-        var row = i + 1;
-        var side = data[i][2];
-        var entry = Number(data[i][4]);
-        var sl = Number(data[i][5]);
-        var riskDistance = Math.abs(entry - sl);
-        var pnlDistance = side === "BUY" ? exitPrice - entry : entry - exitPrice;
-        var rMultiple = riskDistance > 0 ? pnlDistance / riskDistance : "";
-
-        sheet.getRange(row, 8).setValue("CLOSED");
-        sheet.getRange(row, 9).setValue(exitPrice);
-        sheet.getRange(row, 10).setValue(new Date());
-        sheet.getRange(row, 11).setValue(rMultiple);
-
-        return jsonResponse({ ok: true, id: id, r_multiple: rMultiple });
-      }
-    }
-    return jsonResponse({ ok: false, error: "ไม่พบไม้เลขนี้" });
-  }
-
-  if (action === "list_open") {
-    var data = sheet.getDataRange().getValues();
-    var open = [];
-    for (var i = 1; i < data.length; i++) {
-      if (data[i][7] === "OPEN") {
-        open.push({
-          id: data[i][0],
-          side: data[i][2],
-          symbol: data[i][3],
-          entry: data[i][4],
-          sl: data[i][5],
-          tp: data[i][6],
-        });
-      }
-    }
-    return jsonResponse({ ok: true, trades: open });
-  }
-
-  if (action === "stats") {
-    var data = sheet.getDataRange().getValues();
-    var wins = 0, losses = 0, totalR = 0, closed = 0;
-    for (var i = 1; i < data.length; i++) {
-      if (data[i][7] === "CLOSED") {
-        closed++;
-        var r = Number(data[i][10]);
-        if (!isNaN(r)) {
-          totalR += r;
-          if (r > 0) wins++;
-          else if (r < 0) losses++;
-        }
-      }
-    }
-    return jsonResponse({ ok: true, closed: closed, wins: wins, losses: losses, total_r: totalR });
-  }
-
-  return jsonResponse({ ok: false, error: "unknown action" });
-}
-
-function getNextId(sheet) {
-  var lastRow = sheet.getLastRow();
-  if (lastRow <= 1) return 1;
-  var lastId = sheet.getRange(lastRow, 1).getValue();
-  return (parseInt(lastId, 10) || 0) + 1;
-}
-
-function jsonResponse(obj) {
-  return ContentService.createTextOutput(JSON.stringify(obj)).setMimeType(ContentService.MimeType.JSON);
-}
