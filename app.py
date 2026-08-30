@@ -557,8 +557,8 @@ def webhook():
             "/trades — ดูไม้ที่เปิดอยู่\n"
             "/stats — สรุปผลรวม\n\n"
             "<b>Watchlist หุ้น:</b>\n"
-            "/watch SYMBOL — เพิ่มเข้า watchlist เช่น /watch PTT\n"
-            "/unwatch SYMBOL — เอาออก\n"
+            "/watch SYMBOL — เพิ่มเข้า watchlist พิมพ์หลายตัวคั่นด้วยเว้นวรรคได้ เช่น /watch PTT ADVANC AAPL\n"
+            "/unwatch SYMBOL — เอาออก (พิมพ์หลายตัวได้เหมือนกัน)\n"
             "/watchlist — ดูราคาทุกตัวใน watchlist ตอนนี้\n\n"
             "<b>แจ้งเตือนราคาหุ้น:</b>\n"
             "/alert SYMBOL ราคาเป้าหมาย เช่น /alert PTT 35\n"
@@ -625,16 +625,23 @@ def webhook():
         return jsonify(ok=True)
 
     if text.startswith("/watch ") or text.startswith("/watch\n"):
-        symbol = text.split(maxsplit=1)[1].strip().upper()
-        send_message(chat_id, add_to_watchlist(symbol))
+        symbols_part = text.split(maxsplit=1)[1].strip()
+        symbols = [s for s in symbols_part.upper().split() if s]
+        if not symbols:
+            send_message(chat_id, "รูปแบบ: /watch SYMBOL [SYMBOL ...]\nตัวอย่าง: /watch PTT หรือ /watch PTT ADVANC AAPL")
+            return jsonify(ok=True)
+        results = [add_to_watchlist(sym) for sym in symbols]
+        send_message(chat_id, "\n".join(results))
         return jsonify(ok=True)
 
     if text.startswith("/unwatch"):
         parts = text.split(maxsplit=1)
         if len(parts) != 2:
-            send_message(chat_id, "รูปแบบ: /unwatch SYMBOL\nตัวอย่าง: /unwatch PTT")
+            send_message(chat_id, "รูปแบบ: /unwatch SYMBOL [SYMBOL ...]\nตัวอย่าง: /unwatch PTT หรือ /unwatch PTT ADVANC")
             return jsonify(ok=True)
-        send_message(chat_id, remove_from_watchlist(parts[1].strip().upper()))
+        symbols = [s for s in parts[1].strip().upper().split() if s]
+        results = [remove_from_watchlist(sym) for sym in symbols]
+        send_message(chat_id, "\n".join(results))
         return jsonify(ok=True)
 
     if text.startswith("/watchlist"):
