@@ -6,6 +6,7 @@ import requests
 import yfinance as yf
 
 from forex import build_forex_alert_message, build_symbol_report, resolve_forex_symbol
+from journal import close_trade, get_open_trades_raw, get_stats, list_open_trades, log_trade
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -18,21 +19,141 @@ FOREX_CHAT_ID = os.environ.get("FOREX_CHAT_ID", "")
 FOREX_CRON_SECRET = os.environ.get("FOREX_CRON_SECRET", "")
 
 
-def send_message(chat_id, text):
-    """Send a message back to a Telegram chat."""
+def send_message(chat_id, text, reply_markup=None):
+    """Send a message back to a Telegram chat. reply_markup can carry an
+    inline keyboard (see _keyboard())."""
+    try:
+        payload = {
+            "chat_id": chat_id,
+            "text": text,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": True,
+        }
+        if reply_markup:
+            payload["reply_markup"] = reply_markup
+        requests.post(f"{TELEGRAM_API}/sendMessage", json=payload, timeout=10)
+    except Exception:
+        logger.exception("send_message failed")
+
+
+def answer_callback(callback_query_id):
+    """Acknowledge a button tap so Telegram stops showing the loading spinner."""
     try:
         requests.post(
-            f"{TELEGRAM_API}/sendMessage",
-            json={
-                "chat_id": chat_id,
-                "text": text,
-                "parse_mode": "HTML",
-                "disable_web_page_preview": True,
-            },
+            f"{TELEGRAM_API}/answerCallbackQuery",
+            json={"callback_query_id": callback_query_id},
             timeout=10,
         )
     except Exception:
-        logger.exception("send_message failed")
+        logger.exception("answer_callback failed")
+
+
+def _keyboard(rows):
+    return {"inline_keyboard": rows}
+
+
+# In-memory per-chat state for the guided /log and /close flows (button
+# taps + follow-up text answers). This resets if the process restarts —
+# e.g. Render's free tier sleeping after 15 min idle — but a form is
+# normally filled within a minute or two of active back-and-forth, which
+# itself keeps the service awake, so in practice this is rarely an issue.
+_log_state = {}
+_close_state = {}
+
+
+def start_log_flow(chat_id):
+    _log_state[chat_id] = {"step": "side"}
+    send_message(
+        chat_id,
+        "บันทึกไม้ใหม่ — ฝั่งไหนครับ?",
+        _keyboard([[
+            {"text": "🟢 BUY", "callback_data": "logside:BUY"},
+            {"text": "🔴 SELL", "callback_data": "logside:SELL"},
+        ]]),
+    )
+
+
+def start_close_flow(chat_id):
+    trades = get_open_trades_raw()
+    if trades is None:
+        send_message(chat_id, "❌ ดึงรายการไม้เปิดไม่ได้ตอนนี้ครับ")
+        return
+    if not trades:
+        send_message(chat_id, "ตอนนี้ไม่มีไม้ที่เปิดอยู่ครับ")
+        return
+    rows = [
+        [{
+            "text": f"#{t['id']} {t['side']} {t['symbol']} @ {t['entry']}",
+            "callback_data": f"closepick:{t['id']}",
+        }]
+        for t in trades
+    ]
+    send_message(chat_id, "จะปิดไม้ไหนครับ?", _keyboard(rows))
+
+
+def handle_callback(callback):
+    """Handle an inline-button tap (Telegram 'callback_query' update)."""
+    callback_id = callback["id"]
+    chat_id = callback["message"]["chat"]["id"]
+    data = callback.get("data", "")
+    answer_callback(callback_id)
+
+    if data.startswith("logside:"):
+        side = data.split(":", 1)[1]
+        _log_state[chat_id] = {"step": "symbol", "side": side}
+        send_message(chat_id, "พิมพ์สัญลักษณ์ที่เทรด (เช่น XAUUSD)")
+        return
+
+    if data.startswith("logconfirm:"):
+        choice = data.split(":", 1)[1]
+        state = _log_state.pop(chat_id, None)
+        if choice == "yes" and state:
+            send_message(
+                chat_id,
+                log_trade(
+                    state["side"], state["symbol"], state["entry"],
+                    state["sl"], state["tp"], state.get("note", ""),
+                ),
+            )
+        else:
+            send_message(chat_id, "ยกเลิกแล้วครับ")
+        return
+
+    if data.startswith("closepick:"):
+        trade_id = data.split(":", 1)[1]
+        trades = get_open_trades_raw() or []
+        trade = next((t for t in trades if str(t["id"]) == trade_id), None)
+        if not trade:
+            send_message(chat_id, "ไม่พบไม้นี้แล้วครับ (อาจปิดไปแล้ว)")
+            return
+        _close_state[chat_id] = {"trade_id": trade_id, "tp": trade["tp"], "sl": trade["sl"]}
+        send_message(
+            chat_id,
+            f"ไม้ #{trade_id} จะปิดยังไง?",
+            _keyboard([
+                [
+                    {"text": f"🎯 TP ({trade['tp']})", "callback_data": "closeat:tp"},
+                    {"text": f"🛑 SL ({trade['sl']})", "callback_data": "closeat:sl"},
+                ],
+                [{"text": "✏️ พิมพ์ราคาเอง", "callback_data": "closeat:custom"}],
+            ]),
+        )
+        return
+
+    if data.startswith("closeat:"):
+        choice = data.split(":", 1)[1]
+        state = _close_state.get(chat_id)
+        if not state:
+            send_message(chat_id, "เซสชันหมดอายุแล้วครับ ลองพิมพ์ /close ใหม่")
+            return
+        if choice == "custom":
+            state["step"] = "await_price"
+            send_message(chat_id, "พิมพ์ราคาที่ปิดจริงครับ")
+            return
+        exit_price = state["tp"] if choice == "tp" else state["sl"]
+        _close_state.pop(chat_id, None)
+        send_message(chat_id, close_trade(state["trade_id"], exit_price))
+        return
 
 
 def fmt_num(value, digits=2):
@@ -291,6 +412,12 @@ def forex_check():
 @app.route(f"/webhook/{TELEGRAM_TOKEN}", methods=["POST"])
 def webhook():
     update = request.get_json(force=True, silent=True) or {}
+
+    callback = update.get("callback_query")
+    if callback:
+        handle_callback(callback)
+        return jsonify(ok=True)
+
     message = update.get("message") or update.get("edited_message")
     if not message:
         return jsonify(ok=True)
@@ -298,6 +425,77 @@ def webhook():
     chat_id = message["chat"]["id"]
     text = (message.get("text") or "").strip()
     if not text:
+        return jsonify(ok=True)
+
+    if text == "/cancel":
+        had_state = _log_state.pop(chat_id, None) or _close_state.pop(chat_id, None)
+        send_message(chat_id, "ยกเลิกแล้วครับ" if had_state else "ไม่มีอะไรให้ยกเลิกตอนนี้ครับ")
+        return jsonify(ok=True)
+
+    # --- guided /log flow: waiting for the next typed answer ---
+    if chat_id in _log_state:
+        state = _log_state[chat_id]
+        step = state["step"]
+        if step == "symbol":
+            state["symbol"] = text.upper()
+            state["step"] = "entry"
+            send_message(chat_id, "ราคาเข้า (Entry)?")
+            return jsonify(ok=True)
+        if step == "entry":
+            try:
+                state["entry"] = float(text)
+            except ValueError:
+                send_message(chat_id, "พิมพ์เป็นตัวเลขครับ เช่น 2650")
+                return jsonify(ok=True)
+            state["step"] = "sl"
+            send_message(chat_id, "Stop Loss (SL)?")
+            return jsonify(ok=True)
+        if step == "sl":
+            try:
+                state["sl"] = float(text)
+            except ValueError:
+                send_message(chat_id, "พิมพ์เป็นตัวเลขครับ")
+                return jsonify(ok=True)
+            state["step"] = "tp"
+            send_message(chat_id, "Take Profit (TP)?")
+            return jsonify(ok=True)
+        if step == "tp":
+            try:
+                state["tp"] = float(text)
+            except ValueError:
+                send_message(chat_id, "พิมพ์เป็นตัวเลขครับ")
+                return jsonify(ok=True)
+            state["step"] = "note"
+            send_message(chat_id, "หมายเหตุ (ถ้าไม่มีพิมพ์ -)")
+            return jsonify(ok=True)
+        if step == "note":
+            state["note"] = "" if text == "-" else text
+            summary = (
+                "ยืนยันบันทึกไม้นี้มั้ย?\n\n"
+                f"{state['side']} {state['symbol']} @ {state['entry']}\n"
+                f"SL: {state['sl']} | TP: {state['tp']}\n"
+                f"หมายเหตุ: {state['note'] or '-'}"
+            )
+            send_message(
+                chat_id,
+                summary,
+                _keyboard([[
+                    {"text": "✅ บันทึก", "callback_data": "logconfirm:yes"},
+                    {"text": "❌ ยกเลิก", "callback_data": "logconfirm:no"},
+                ]]),
+            )
+            return jsonify(ok=True)
+
+    # --- guided /close flow: waiting for a custom exit price ---
+    if chat_id in _close_state and _close_state[chat_id].get("step") == "await_price":
+        state = _close_state.pop(chat_id)
+        try:
+            exit_price = float(text)
+        except ValueError:
+            send_message(chat_id, "พิมพ์เป็นตัวเลขครับ")
+            _close_state[chat_id] = state  # still waiting, put it back
+            return jsonify(ok=True)
+        send_message(chat_id, close_trade(state["trade_id"], exit_price))
         return jsonify(ok=True)
 
     if text.startswith("/start") or text.startswith("/help"):
@@ -308,8 +506,70 @@ def webhook():
             "แล้วบอทจะตอบราคา ข่าวล่าสุด และพื้นฐานบริษัทให้ครับ\n\n"
             "หรือพิมพ์สัญลักษณ์ทอง/ดัชนี/คู่เงิน เช่น XAUUSD, US100, EURUSD "
             "เพื่อเช็คราคาสดและ Bias จาก Fibo 4H ตามระบบ ize\n\n"
+            "<b>บันทึกไม้เทรด:</b>\n"
+            "พิมพ์ /log หรือ \"บันทึก\" เฉยๆ ให้บอทถามทีละขั้นตอนพร้อมปุ่มกด\n"
+            "(หรือพิมพ์รวดเดียว: /log BUY XAUUSD 2650 2620 2700)\n"
+            "/close หรือ \"ปิดไม้\" — เลือกไม้ที่จะปิดจากปุ่ม\n"
+            "/trades — ดูไม้ที่เปิดอยู่\n"
+            "/stats — สรุปผลรวม\n\n"
             f"Chat ID ของคุณ (เอาไปตั้งค่าแจ้งเตือน Forex): <code>{chat_id}</code>",
         )
+        return jsonify(ok=True)
+
+    if text.startswith("/log") or text == "บันทึก":
+        parts = text.split()
+        if len(parts) <= 1:
+            start_log_flow(chat_id)
+            return jsonify(ok=True)
+        if len(parts) < 6:
+            send_message(
+                chat_id,
+                "รูปแบบ: /log BUY หรือ SELL SYMBOL ENTRY SL TP [หมายเหตุ]\n"
+                "ตัวอย่าง: /log BUY XAUUSD 2650 2620 2700\n"
+                "หรือพิมพ์ /log เฉยๆ ให้บอทถามทีละขั้นตอนก็ได้ครับ",
+            )
+            return jsonify(ok=True)
+        _, side, symbol, entry, sl, tp, *note_parts = parts
+        side = side.upper()
+        if side not in ("BUY", "SELL"):
+            send_message(chat_id, "ระบุ BUY หรือ SELL เท่านั้นครับ")
+            return jsonify(ok=True)
+        try:
+            entry_f, sl_f, tp_f = float(entry), float(sl), float(tp)
+        except ValueError:
+            send_message(chat_id, "ราคา entry/SL/TP ต้องเป็นตัวเลขครับ")
+            return jsonify(ok=True)
+        note = " ".join(note_parts)
+        send_message(chat_id, log_trade(side, symbol.upper(), entry_f, sl_f, tp_f, note))
+        return jsonify(ok=True)
+
+    if text.startswith("/close") or text == "ปิดไม้":
+        parts = text.split()
+        if len(parts) <= 1:
+            start_close_flow(chat_id)
+            return jsonify(ok=True)
+        if len(parts) != 3:
+            send_message(
+                chat_id,
+                "รูปแบบ: /close ID ราคาที่ปิด\nตัวอย่าง: /close 1 2680\n"
+                "หรือพิมพ์ /close เฉยๆ ให้เลือกจากปุ่มก็ได้ครับ",
+            )
+            return jsonify(ok=True)
+        _, trade_id, exit_price = parts
+        try:
+            exit_price_f = float(exit_price)
+        except ValueError:
+            send_message(chat_id, "ราคาที่ปิดต้องเป็นตัวเลขครับ")
+            return jsonify(ok=True)
+        send_message(chat_id, close_trade(trade_id, exit_price_f))
+        return jsonify(ok=True)
+
+    if text.startswith("/trades"):
+        send_message(chat_id, list_open_trades())
+        return jsonify(ok=True)
+
+    if text.startswith("/stats"):
+        send_message(chat_id, get_stats())
         return jsonify(ok=True)
 
     if resolve_forex_symbol(text):
