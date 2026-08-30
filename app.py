@@ -319,12 +319,48 @@ def compute_dcf_value(ticker, info, years=5, terminal_growth=0.025):
     return intrinsic_per_share, r, g1, g_term
 
 
-def compute_monthly_bias(ticker, lookback_months=24):
+def _find_latest_swing(window, pivot_window=1):
+    """Find the most recent confirmed swing leg (a low-to-high or
+    high-to-low move), using simple local-extremum pivot detection,
+    instead of the absolute min/max of the whole lookback window. A
+    long-ago extreme that price never revisits makes a stale, useless
+    anchor for a trade decision — the latest actual turning point is
+    what matters.
+    Returns (older_price, newer_price) or None if no swing pair is found.
+    """
+    highs = window["High"].tolist()
+    lows = window["Low"].tolist()
+    n = len(window)
+
+    pivots = []  # (index, price, kind)
+    for i in range(pivot_window, n - pivot_window):
+        seg_high = highs[i - pivot_window : i + pivot_window + 1]
+        if highs[i] == max(seg_high):
+            pivots.append((i, highs[i], "high"))
+        seg_low = lows[i - pivot_window : i + pivot_window + 1]
+        if lows[i] == min(seg_low):
+            pivots.append((i, lows[i], "low"))
+
+    pivots.sort(key=lambda p: p[0])
+    if len(pivots) < 2:
+        return None
+
+    latest = pivots[-1]
+    for earlier in reversed(pivots[:-1]):
+        if earlier[2] != latest[2]:
+            return earlier[1], latest[1]
+    return None
+
+
+def compute_monthly_bias(ticker, lookback_months=24, pivot_window=1):
     """Same cheap/expensive Fibonacci bias as the ize forex system (swing
     low/high -> 0/50/100 range -> above 50% = แพง/SELL zone, below = ถูก/
     BUY zone), but read from monthly candles instead of 4H — stocks move
     far slower than gold/forex, so a monthly view suits the same idea
-    much better than an intraday one.
+    much better than an intraday one. The swing itself is the most
+    recent confirmed pivot-to-pivot leg, not just the window's raw
+    highest-high / lowest-low, so it stays relevant to a current
+    decision rather than anchored on an old extreme.
     """
     try:
         hist = ticker.history(period="5y", interval="1mo")
@@ -334,11 +370,13 @@ def compute_monthly_bias(ticker, lookback_months=24):
         return None
 
     window = hist.tail(lookback_months)
-    if window.empty:
+    if len(window) < (pivot_window * 2 + 3):
         return None
 
-    swing_low = float(window["Low"].min())
-    swing_high = float(window["High"].max())
+    swing = _find_latest_swing(window, pivot_window=pivot_window)
+    if not swing:
+        return None
+    swing_low, swing_high = min(swing), max(swing)
     if swing_high <= swing_low:
         return None
 
