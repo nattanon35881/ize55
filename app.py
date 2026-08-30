@@ -8,6 +8,16 @@ import yfinance as yf
 from dashboard import build_dashboard_html
 from forex import build_forex_alert_message, build_symbol_report, resolve_forex_symbol
 from journal import close_trade, get_all_trades, get_open_trades_raw, get_stats, list_open_trades, log_trade
+from watchlist import (
+    add_alert,
+    add_to_watchlist,
+    build_watchlist_summary,
+    check_and_trigger_alerts,
+    get_price,
+    list_alerts,
+    remove_alert,
+    remove_from_watchlist,
+)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -421,6 +431,28 @@ def dashboard():
     return build_dashboard_html(trades)
 
 
+@app.route(f"/watchlist-check/{FOREX_CRON_SECRET}", methods=["GET", "POST"])
+def watchlist_check():
+    # Same shared secret as /forex-check — set up a daily cron job (e.g.
+    # 9:00 AM) at cron-job.org pointing here, same as the forex alerts.
+    if not FOREX_CHAT_ID:
+        return jsonify(ok=False, error="FOREX_CHAT_ID is not set"), 400
+    send_message(FOREX_CHAT_ID, build_watchlist_summary())
+    return jsonify(ok=True)
+
+
+@app.route(f"/alert-check/{FOREX_CRON_SECRET}", methods=["GET", "POST"])
+def alert_check():
+    # Point a cron job here every 15-30 min during market hours to check
+    # active price alerts and notify when one is hit.
+    if not FOREX_CHAT_ID:
+        return jsonify(ok=False, error="FOREX_CHAT_ID is not set"), 400
+    messages = check_and_trigger_alerts()
+    for message in messages:
+        send_message(FOREX_CHAT_ID, message)
+    return jsonify(ok=True, triggered=len(messages))
+
+
 @app.route(f"/webhook/{TELEGRAM_TOKEN}", methods=["POST"])
 def webhook():
     update = request.get_json(force=True, silent=True) or {}
@@ -524,6 +556,14 @@ def webhook():
             "/close หรือ \"ปิดไม้\" — เลือกไม้ที่จะปิดจากปุ่ม\n"
             "/trades — ดูไม้ที่เปิดอยู่\n"
             "/stats — สรุปผลรวม\n\n"
+            "<b>Watchlist หุ้น:</b>\n"
+            "/watch SYMBOL — เพิ่มเข้า watchlist เช่น /watch PTT\n"
+            "/unwatch SYMBOL — เอาออก\n"
+            "/watchlist — ดูราคาทุกตัวใน watchlist ตอนนี้\n\n"
+            "<b>แจ้งเตือนราคาหุ้น:</b>\n"
+            "/alert SYMBOL ราคาเป้าหมาย เช่น /alert PTT 35\n"
+            "/alerts — ดูแจ้งเตือนที่ตั้งไว้\n"
+            "/unalert ID — ยกเลิกแจ้งเตือน\n\n"
             f"Chat ID ของคุณ (เอาไปตั้งค่าแจ้งเตือน Forex): <code>{chat_id}</code>",
         )
         return jsonify(ok=True)
@@ -582,6 +622,55 @@ def webhook():
 
     if text.startswith("/stats"):
         send_message(chat_id, get_stats())
+        return jsonify(ok=True)
+
+    if text.startswith("/watch ") or text.startswith("/watch\n"):
+        symbol = text.split(maxsplit=1)[1].strip().upper()
+        send_message(chat_id, add_to_watchlist(symbol))
+        return jsonify(ok=True)
+
+    if text.startswith("/unwatch"):
+        parts = text.split(maxsplit=1)
+        if len(parts) != 2:
+            send_message(chat_id, "รูปแบบ: /unwatch SYMBOL\nตัวอย่าง: /unwatch PTT")
+            return jsonify(ok=True)
+        send_message(chat_id, remove_from_watchlist(parts[1].strip().upper()))
+        return jsonify(ok=True)
+
+    if text.startswith("/watchlist"):
+        send_message(chat_id, build_watchlist_summary())
+        return jsonify(ok=True)
+
+    if text.startswith("/alert ") and not text.startswith("/alerts"):
+        parts = text.split()
+        if len(parts) != 3:
+            send_message(chat_id, "รูปแบบ: /alert SYMBOL ราคาเป้าหมาย\nตัวอย่าง: /alert PTT 35")
+            return jsonify(ok=True)
+        _, symbol, target = parts
+        symbol = symbol.upper()
+        try:
+            target_f = float(target)
+        except ValueError:
+            send_message(chat_id, "ราคาต้องเป็นตัวเลขครับ")
+            return jsonify(ok=True)
+        current = get_price(symbol)
+        if not current:
+            send_message(chat_id, f"หาราคา {symbol} ไม่เจอครับ")
+            return jsonify(ok=True)
+        direction = "UP" if target_f >= current["price"] else "DOWN"
+        send_message(chat_id, add_alert(symbol, target_f, direction))
+        return jsonify(ok=True)
+
+    if text.startswith("/unalert"):
+        parts = text.split()
+        if len(parts) != 2:
+            send_message(chat_id, "รูปแบบ: /unalert ID\nตัวอย่าง: /unalert 1")
+            return jsonify(ok=True)
+        send_message(chat_id, remove_alert(parts[1]))
+        return jsonify(ok=True)
+
+    if text.startswith("/alerts"):
+        send_message(chat_id, list_alerts())
         return jsonify(ok=True)
 
     if resolve_forex_symbol(text):
