@@ -319,6 +319,42 @@ def compute_dcf_value(ticker, info, years=5, terminal_growth=0.025):
     return intrinsic_per_share, r, g1, g_term
 
 
+def compute_monthly_bias(ticker, lookback_months=24):
+    """Same cheap/expensive Fibonacci bias as the ize forex system (swing
+    low/high -> 0/50/100 range -> above 50% = แพง/SELL zone, below = ถูก/
+    BUY zone), but read from monthly candles instead of 4H — stocks move
+    far slower than gold/forex, so a monthly view suits the same idea
+    much better than an intraday one.
+    """
+    try:
+        hist = ticker.history(period="5y", interval="1mo")
+    except Exception:
+        return None
+    if hist is None or hist.empty:
+        return None
+
+    window = hist.tail(lookback_months)
+    if window.empty:
+        return None
+
+    swing_low = float(window["Low"].min())
+    swing_high = float(window["High"].max())
+    if swing_high <= swing_low:
+        return None
+
+    current_price = float(hist["Close"].iloc[-1])
+    fib_50 = (swing_low + swing_high) / 2
+    bias = "แพง — โซน SELL" if current_price > fib_50 else "ถูก — โซน BUY"
+
+    return {
+        "price": current_price,
+        "swing_low": swing_low,
+        "swing_high": swing_high,
+        "fib_50": fib_50,
+        "bias": bias,
+    }
+
+
 def build_report(raw_symbol):
     symbol = raw_symbol.strip().upper()
     if not symbol:
@@ -370,6 +406,20 @@ def build_report(raw_symbol):
     market_cap = info.get("marketCap")
     if market_cap:
         lines.append(f"Market Cap: {fmt_num(market_cap, digits=0)}")
+
+    monthly_bias = None
+    try:
+        monthly_bias = compute_monthly_bias(ticker)
+    except Exception:
+        logger.exception("compute_monthly_bias failed for %s", resolved)
+
+    if monthly_bias:
+        lines.append(
+            f"\n📊 <b>Bias จาก Fibo รายเดือน ({monthly_bias['bias']})</b>\n"
+            f"   0% (swing low, 24 เดือนล่าสุด): {fmt_num(monthly_bias['swing_low'])}\n"
+            f"   50%: {fmt_num(monthly_bias['fib_50'])}\n"
+            f"   100% (swing high): {fmt_num(monthly_bias['swing_high'])}"
+        )
 
     dcf_result = None
     try:
