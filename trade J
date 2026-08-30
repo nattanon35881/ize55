@@ -1,0 +1,196 @@
+import os
+import logging
+
+import requests
+
+logger = logging.getLogger(__name__)
+
+SHEET_WEBAPP_URL = os.environ.get("SHEET_WEBAPP_URL", "")
+
+
+def _call_sheet(payload):
+    if not SHEET_WEBAPP_URL:
+        return None
+    try:
+        resp = requests.post(SHEET_WEBAPP_URL, json=payload, timeout=15)
+        return resp.json()
+    except Exception:
+        logger.exception("Sheet webapp call failed: %s", payload)
+        return None
+
+
+def log_trade(side, symbol, entry, sl, tp, note=""):
+    result = _call_sheet({
+        "action": "log",
+        "side": side,
+        "symbol": symbol,
+        "entry": entry,
+        "sl": sl,
+        "tp": tp,
+        "note": note,
+    })
+    if not result or not result.get("ok"):
+        return "❌ บันทึกไม่สำเร็จ เช็คว่าตั้งค่า SHEET_WEBAPP_URL ถูกต้องหรือยังครับ"
+
+    trade_id = result["id"]
+    return (
+        f"✅ บันทึกไม้ #{trade_id} แล้วครับ\n"
+        f"{side} {symbol} @ {entry}\n"
+        f"SL: {sl} | TP: {tp}\n\n"
+        f"ปิดไม้นี้ทีหลังด้วย: /close {trade_id} ราคาที่ปิด"
+    )
+
+
+def close_trade(trade_id, exit_price):
+    result = _call_sheet({
+        "action": "close",
+        "id": trade_id,
+        "exit_price": exit_price,
+    })
+    if not result or not result.get("ok"):
+        error = (result or {}).get("error", "ไม่ทราบสาเหตุ — เช็ค SHEET_WEBAPP_URL ด้วยครับ")
+        return f"❌ ปิดไม้ #{trade_id} ไม่สำเร็จ ({error})"
+
+    r_multiple = result.get("r_multiple")
+    r_text = f"{r_multiple:.2f}R" if isinstance(r_multiple, (int, float)) else "-"
+    return f"✅ ปิดไม้ #{trade_id} ที่ {exit_price} แล้วครับ (ผลลัพธ์ {r_text})"
+
+
+def list_open_trades():
+    result = _call_sheet({"action": "list_open"})
+    if not result or not result.get("ok"):
+        return "❌ ดึงรายการไม้เปิดไม่ได้ตอนนี้ครับ"
+
+    trades = result.get("trades", [])
+    if not trades:
+        return "ตอนนี้ไม่มีไม้ที่เปิดอยู่ครับ"
+
+    lines = ["📋 <b>ไม้ที่เปิดอยู่:</b>"]
+    for t in trades:
+        lines.append(
+            f"#{t['id']} {t['side']} {t['symbol']} @ {t['entry']} "
+            f"(SL {t['sl']} / TP {t['tp']})"
+        )
+    return "\n".join(lines)
+
+
+def get_stats():
+    result = _call_sheet({"action": "stats"})
+    if not result or not result.get("ok"):
+        return "❌ ดึงสถิติไม่ได้ตอนนี้ครับ"
+
+    closed = result.get("closed", 0)
+    wins = result.get("wins", 0)
+    losses = result.get("losses", 0)
+    total_r = result.get("total_r", 0)
+    win_rate = (wins / closed * 100) if closed else 0
+
+    return (
+        "📊 <b>สรุปผลการเทรด</b>\n"
+        f"ปิดแล้ว: {closed} ไม้ (ชนะ {wins} / แพ้ {losses})\n"
+        f"Win rate: {win_rate:.1f}%\n"
+        f"รวม: {total_r:+.2f}R"
+    )
+// วางโค้ดนี้ใน Google Sheet ของคุณ: Extensions > Apps Script
+// แล้ว Deploy เป็น Web App (ดูขั้นตอนใน README.md)
+
+function doPost(e) {
+  var sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName("Trades");
+  if (!sheet) {
+    sheet = SpreadsheetApp.getActiveSpreadsheet().insertSheet("Trades");
+    sheet.appendRow(["ID", "Timestamp", "Side", "Symbol", "Entry", "SL", "TP", "Status", "ExitPrice", "ExitTime", "PnL_R", "Note"]);
+  }
+
+  var body = JSON.parse(e.postData.contents);
+  var action = body.action;
+
+  if (action === "log") {
+    var newId = getNextId(sheet);
+    sheet.appendRow([
+      newId,
+      new Date(),
+      body.side,
+      body.symbol,
+      body.entry,
+      body.sl,
+      body.tp,
+      "OPEN",
+      "", "", "",
+      body.note || "",
+    ]);
+    return jsonResponse({ ok: true, id: newId });
+  }
+
+  if (action === "close") {
+    var id = body.id;
+    var exitPrice = Number(body.exit_price);
+    var data = sheet.getDataRange().getValues();
+    for (var i = 1; i < data.length; i++) {
+      if (String(data[i][0]) === String(id)) {
+        var row = i + 1;
+        var side = data[i][2];
+        var entry = Number(data[i][4]);
+        var sl = Number(data[i][5]);
+        var riskDistance = Math.abs(entry - sl);
+        var pnlDistance = side === "BUY" ? exitPrice - entry : entry - exitPrice;
+        var rMultiple = riskDistance > 0 ? pnlDistance / riskDistance : "";
+
+        sheet.getRange(row, 8).setValue("CLOSED");
+        sheet.getRange(row, 9).setValue(exitPrice);
+        sheet.getRange(row, 10).setValue(new Date());
+        sheet.getRange(row, 11).setValue(rMultiple);
+
+        return jsonResponse({ ok: true, id: id, r_multiple: rMultiple });
+      }
+    }
+    return jsonResponse({ ok: false, error: "ไม่พบไม้เลขนี้" });
+  }
+
+  if (action === "list_open") {
+    var data = sheet.getDataRange().getValues();
+    var open = [];
+    for (var i = 1; i < data.length; i++) {
+      if (data[i][7] === "OPEN") {
+        open.push({
+          id: data[i][0],
+          side: data[i][2],
+          symbol: data[i][3],
+          entry: data[i][4],
+          sl: data[i][5],
+          tp: data[i][6],
+        });
+      }
+    }
+    return jsonResponse({ ok: true, trades: open });
+  }
+
+  if (action === "stats") {
+    var data = sheet.getDataRange().getValues();
+    var wins = 0, losses = 0, totalR = 0, closed = 0;
+    for (var i = 1; i < data.length; i++) {
+      if (data[i][7] === "CLOSED") {
+        closed++;
+        var r = Number(data[i][10]);
+        if (!isNaN(r)) {
+          totalR += r;
+          if (r > 0) wins++;
+          else if (r < 0) losses++;
+        }
+      }
+    }
+    return jsonResponse({ ok: true, closed: closed, wins: wins, losses: losses, total_r: totalR });
+  }
+
+  return jsonResponse({ ok: false, error: "unknown action" });
+}
+
+function getNextId(sheet) {
+  var lastRow = sheet.getLastRow();
+  if (lastRow <= 1) return 1;
+  var lastId = sheet.getRange(lastRow, 1).getValue();
+  return (parseInt(lastId, 10) || 0) + 1;
+}
+
+function jsonResponse(obj) {
+  return ContentService.createTextOutput(JSON.stringify(obj)).setMimeType(ContentService.MimeType.JSON);
+}
