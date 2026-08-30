@@ -5,8 +5,9 @@ from flask import Flask, request, jsonify
 import requests
 import yfinance as yf
 
+from dashboard import build_dashboard_html
 from forex import build_forex_alert_message, build_symbol_report, resolve_forex_symbol
-from journal import close_trade, get_open_trades_raw, get_stats, list_open_trades, log_trade
+from journal import close_trade, get_all_trades, get_open_trades_raw, get_stats, list_open_trades, log_trade
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -17,6 +18,7 @@ TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
 TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 FOREX_CHAT_ID = os.environ.get("FOREX_CHAT_ID", "")
 FOREX_CRON_SECRET = os.environ.get("FOREX_CRON_SECRET", "")
+DASHBOARD_SECRET = os.environ.get("DASHBOARD_SECRET", "")
 
 
 def send_message(chat_id, text, reply_markup=None):
@@ -407,6 +409,16 @@ def forex_check():
     message = build_forex_alert_message()
     send_message(FOREX_CHAT_ID, message)
     return jsonify(ok=True)
+
+
+@app.route(f"/dashboard/{DASHBOARD_SECRET}", methods=["GET"])
+def dashboard():
+    # Secret is part of the path (like /webhook/<token>) so random visitors
+    # can't view your trade history just by guessing the base URL.
+    trades = get_all_trades()
+    if trades is None:
+        return "ดึงข้อมูลจาก Google Sheet ไม่ได้ตอนนี้ — เช็ค SHEET_WEBAPP_URL ครับ", 502
+    return build_dashboard_html(trades)
 
 
 @app.route(f"/webhook/{TELEGRAM_TOKEN}", methods=["POST"])
