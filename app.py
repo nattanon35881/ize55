@@ -8,6 +8,14 @@ import yfinance as yf
 from dashboard import build_dashboard_html
 from forex import build_forex_alert_message, build_symbol_report, resolve_forex_symbol
 from journal import close_trade, get_all_trades, get_open_trades_raw, get_stats, list_open_trades, log_trade
+from macro import build_macro_dashboard_html, build_macro_report
+from risk import (
+    build_limits_status,
+    check_trading_allowed,
+    format_position_size_message,
+    set_daily_limit,
+    set_weekly_limit,
+)
 from watchlist import (
     add_alert,
     add_to_watchlist,
@@ -74,6 +82,10 @@ _close_state = {}
 
 
 def start_log_flow(chat_id):
+    allowed, reason = check_trading_allowed()
+    if not allowed:
+        send_message(chat_id, reason)
+        return
     _log_state[chat_id] = {"step": "side"}
     send_message(
         chat_id,
@@ -116,6 +128,46 @@ def handle_callback(callback):
         send_message(chat_id, "พิมพ์สัญลักษณ์ที่เทรด (เช่น XAUUSD)")
         return
 
+    if data.startswith("logidm:"):
+        state = _log_state.get(chat_id)
+        if not state:
+            send_message(chat_id, "เซสชันหมดอายุแล้วครับ ลองพิมพ์ /log ใหม่")
+            return
+        state["idm_ok"] = data.split(":", 1)[1] == "yes"
+        state["step"] = "turtle"
+        send_message(
+            chat_id,
+            "Confirm ด้วยสัญญาณ Turtle Soup บน M1/M5 จริงมั้ย?",
+            _keyboard([[
+                {"text": "✅ ใช่", "callback_data": "logturtle:yes"},
+                {"text": "❌ ไม่ใช่", "callback_data": "logturtle:no"},
+            ]]),
+        )
+        return
+
+    if data.startswith("logturtle:"):
+        state = _log_state.get(chat_id)
+        if not state:
+            send_message(chat_id, "เซสชันหมดอายุแล้วครับ ลองพิมพ์ /log ใหม่")
+            return
+        state["turtle_ok"] = data.split(":", 1)[1] == "yes"
+        summary = (
+            "ยืนยันบันทึกไม้นี้มั้ย?\n\n"
+            f"{state['side']} {state['symbol']} @ {state['entry']}\n"
+            f"SL: {state['sl']} | TP: {state['tp']}\n"
+            f"หมายเหตุ: {state['note'] or '-'}\n"
+            f"IDM: {'✅' if state['idm_ok'] else '❌'} | Turtle Soup: {'✅' if state['turtle_ok'] else '❌'}"
+        )
+        send_message(
+            chat_id,
+            summary,
+            _keyboard([[
+                {"text": "✅ บันทึก", "callback_data": "logconfirm:yes"},
+                {"text": "❌ ยกเลิก", "callback_data": "logconfirm:no"},
+            ]]),
+        )
+        return
+
     if data.startswith("logconfirm:"):
         choice = data.split(":", 1)[1]
         state = _log_state.pop(chat_id, None)
@@ -125,6 +177,7 @@ def handle_callback(callback):
                 log_trade(
                     state["side"], state["symbol"], state["entry"],
                     state["sl"], state["tp"], state.get("note", ""),
+                    idm_ok=state.get("idm_ok"), turtle_ok=state.get("turtle_ok"),
                 ),
             )
         else:
@@ -519,6 +572,11 @@ def dashboard():
     return build_dashboard_html(trades)
 
 
+@app.route(f"/macro-dashboard/{DASHBOARD_SECRET}", methods=["GET"])
+def macro_dashboard():
+    return build_macro_dashboard_html()
+
+
 @app.route(f"/watchlist-check/{FOREX_CRON_SECRET}", methods=["GET", "POST"])
 def watchlist_check():
     # Same shared secret as /forex-check — set up a daily cron job (e.g.
@@ -602,18 +660,13 @@ def webhook():
             return jsonify(ok=True)
         if step == "note":
             state["note"] = "" if text == "-" else text
-            summary = (
-                "ยืนยันบันทึกไม้นี้มั้ย?\n\n"
-                f"{state['side']} {state['symbol']} @ {state['entry']}\n"
-                f"SL: {state['sl']} | TP: {state['tp']}\n"
-                f"หมายเหตุ: {state['note'] or '-'}"
-            )
+            state["step"] = "idm"
             send_message(
                 chat_id,
-                summary,
+                "รอ IDM (inducement) ก่อนเข้าไม้จริงมั้ย?",
                 _keyboard([[
-                    {"text": "✅ บันทึก", "callback_data": "logconfirm:yes"},
-                    {"text": "❌ ยกเลิก", "callback_data": "logconfirm:no"},
+                    {"text": "✅ ใช่", "callback_data": "logidm:yes"},
+                    {"text": "❌ ไม่ใช่", "callback_data": "logidm:no"},
                 ]]),
             )
             return jsonify(ok=True)
@@ -652,6 +705,14 @@ def webhook():
             "/alert SYMBOL ราคาเป้าหมาย เช่น /alert PTT 35\n"
             "/alerts — ดูแจ้งเตือนที่ตั้งไว้\n"
             "/unalert ID — ยกเลิกแจ้งเตือน\n\n"
+            "<b>Macro:</b>\n"
+            "/macro — DXY, US 10Y Yield, SET Index แบบสรุปเร็ว\n\n"
+            "<b>คำนวณขนาดโพซิชัน:</b>\n"
+            "/size SYMBOL ทุน RISK% ราคาเข้า SL\n"
+            "เช่น /size XAUUSD 10000 1 2650 2620\n\n"
+            "<b>วงเงินขาดทุน (auto lockout):</b>\n"
+            "/setlimit daily 3 หรือ /setlimit weekly 6 (หน่วยเป็น R)\n"
+            "/limits — ดูสถานะปัจจุบัน\n\n"
             f"Chat ID ของคุณ (เอาไปตั้งค่าแจ้งเตือน Forex): <code>{chat_id}</code>",
         )
         return jsonify(ok=True)
@@ -680,6 +741,10 @@ def webhook():
             send_message(chat_id, "ราคา entry/SL/TP ต้องเป็นตัวเลขครับ")
             return jsonify(ok=True)
         note = " ".join(note_parts)
+        allowed, reason = check_trading_allowed()
+        if not allowed:
+            send_message(chat_id, reason)
+            return jsonify(ok=True)
         send_message(chat_id, log_trade(side, symbol.upper(), entry_f, sl_f, tp_f, note))
         return jsonify(ok=True)
 
@@ -766,6 +831,55 @@ def webhook():
 
     if text.startswith("/alerts"):
         send_message(chat_id, list_alerts())
+        return jsonify(ok=True)
+
+    if text.startswith("/macro"):
+        send_message(chat_id, build_macro_report())
+        return jsonify(ok=True)
+
+    if text.startswith("/size"):
+        parts = text.split()
+        if len(parts) != 5:
+            send_message(
+                chat_id,
+                "รูปแบบ: /size SYMBOL ทุน RISK% ราคาเข้า SL\n"
+                "ตัวอย่าง: /size XAUUSD 10000 1 2650 2620",
+            )
+            return jsonify(ok=True)
+        _, size_symbol, capital, risk_pct, entry_price, sl_price = parts
+        try:
+            capital_f = float(capital)
+            risk_pct_f = float(risk_pct)
+            entry_f = float(entry_price)
+            sl_f = float(sl_price)
+        except ValueError:
+            send_message(chat_id, "ทุน/RISK%/ราคาเข้า/SL ต้องเป็นตัวเลขครับ")
+            return jsonify(ok=True)
+        send_message(chat_id, format_position_size_message(size_symbol, capital_f, risk_pct_f, entry_f, sl_f))
+        return jsonify(ok=True)
+
+    if text.startswith("/setlimit"):
+        parts = text.split()
+        if len(parts) != 3 or parts[1].lower() not in ("daily", "weekly"):
+            send_message(
+                chat_id,
+                "รูปแบบ: /setlimit daily ตัวเลขR หรือ /setlimit weekly ตัวเลขR\n"
+                "ตัวอย่าง: /setlimit daily 3",
+            )
+            return jsonify(ok=True)
+        try:
+            limit_value = float(parts[2])
+        except ValueError:
+            send_message(chat_id, "ค่า limit ต้องเป็นตัวเลขครับ")
+            return jsonify(ok=True)
+        if parts[1].lower() == "daily":
+            send_message(chat_id, set_daily_limit(limit_value))
+        else:
+            send_message(chat_id, set_weekly_limit(limit_value))
+        return jsonify(ok=True)
+
+    if text.startswith("/limits"):
+        send_message(chat_id, build_limits_status())
         return jsonify(ok=True)
 
     if resolve_forex_symbol(text):
