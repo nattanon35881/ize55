@@ -892,6 +892,40 @@ def webhook():
     return jsonify(ok=True)
 
 
+def setup_bot_commands():
+    """Register the command list with Telegram so it shows up as a native
+    tappable menu (the '/' button, or the menu icon, next to the message
+    box) — this is the real Telegram equivalent of a commands popup, no
+    custom UI code needed, just this one-time registration call. Runs
+    automatically every time the app starts (cheap and idempotent, so
+    Render's free-tier cold starts calling it repeatedly is harmless)."""
+    commands = [
+        {"command": "log", "description": "บันทึกไม้เทรดใหม่ (ถามทีละขั้นตอน)"},
+        {"command": "close", "description": "ปิดไม้ที่เปิดอยู่"},
+        {"command": "trades", "description": "ดูไม้ที่เปิดอยู่"},
+        {"command": "stats", "description": "สรุปผลการเทรด + วินัย"},
+        {"command": "cancel", "description": "ยกเลิกฟอร์มที่ทำค้างอยู่"},
+        {"command": "watch", "description": "เพิ่มหุ้นเข้า watchlist"},
+        {"command": "unwatch", "description": "เอาหุ้นออกจาก watchlist"},
+        {"command": "watchlist", "description": "ดูราคาหุ้นใน watchlist"},
+        {"command": "alert", "description": "ตั้งแจ้งเตือนราคาหุ้น"},
+        {"command": "alerts", "description": "ดูแจ้งเตือนที่ตั้งไว้"},
+        {"command": "unalert", "description": "ยกเลิกแจ้งเตือน"},
+        {"command": "macro", "description": "ดู DXY / US10Y Yield / SET Index"},
+        {"command": "size", "description": "คำนวณขนาดโพซิชัน"},
+        {"command": "setlimit", "description": "ตั้งวงเงินขาดทุนสูงสุด (daily/weekly)"},
+        {"command": "limits", "description": "เช็คสถานะวงเงินขาดทุน"},
+        {"command": "help", "description": "ดูเมนูคำสั่งทั้งหมด"},
+    ]
+    try:
+        requests.post(f"{TELEGRAM_API}/setMyCommands", json={"commands": commands}, timeout=10)
+    except Exception:
+        logger.exception("setup_bot_commands failed")
+
+
+setup_bot_commands()
+
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
