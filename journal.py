@@ -19,8 +19,8 @@ def _call_sheet(payload):
         return None
 
 
-def log_trade(side, symbol, entry, sl, tp, note=""):
-    result = _call_sheet({
+def log_trade(side, symbol, entry, sl, tp, note="", idm_ok=None, turtle_ok=None):
+    payload = {
         "action": "log",
         "side": side,
         "symbol": symbol,
@@ -28,7 +28,13 @@ def log_trade(side, symbol, entry, sl, tp, note=""):
         "sl": sl,
         "tp": tp,
         "note": note,
-    })
+    }
+    if idm_ok is not None:
+        payload["idm_ok"] = idm_ok
+    if turtle_ok is not None:
+        payload["turtle_ok"] = turtle_ok
+
+    result = _call_sheet(payload)
     if not result or not result.get("ok"):
         return "❌ บันทึกไม่สำเร็จ เช็คว่าตั้งค่า SHEET_WEBAPP_URL ถูกต้องหรือยังครับ"
 
@@ -102,9 +108,29 @@ def get_stats():
     total_r = result.get("total_r", 0)
     win_rate = (wins / closed * 100) if closed else 0
 
-    return (
-        "📊 <b>สรุปผลการเทรด</b>\n"
-        f"ปิดแล้ว: {closed} ไม้ (ชนะ {wins} / แพ้ {losses})\n"
-        f"Win rate: {win_rate:.1f}%\n"
-        f"รวม: {total_r:+.2f}R"
-    )
+    lines = [
+        "📊 <b>สรุปผลการเทรด</b>",
+        f"ปิดแล้ว: {closed} ไม้ (ชนะ {wins} / แพ้ {losses})",
+        f"Win rate: {win_rate:.1f}%",
+        f"รวม: {total_r:+.2f}R",
+    ]
+
+    disc = result.get("disciplined", {})
+    undisc = result.get("undisciplined", {})
+    disc_closed = disc.get("closed", 0)
+    undisc_closed = undisc.get("closed", 0)
+    if disc_closed or undisc_closed:
+        lines.append("")
+        lines.append("🎯 <b>แยกตามวินัย</b> (ทำครบ = รอ IDM จริง + confirm Turtle Soup จริง)")
+        if disc_closed:
+            disc_wr = disc.get("wins", 0) / disc_closed * 100
+            lines.append(f"ทำตามระบบครบ: {disc_closed} ไม้ — Win rate {disc_wr:.1f}%")
+        else:
+            lines.append("ทำตามระบบครบ: ยังไม่มีข้อมูล")
+        if undisc_closed:
+            undisc_wr = undisc.get("wins", 0) / undisc_closed * 100
+            lines.append(f"ทำไม่ครบ: {undisc_closed} ไม้ — Win rate {undisc_wr:.1f}%")
+        else:
+            lines.append("ทำไม่ครบ: ยังไม่มีข้อมูล")
+
+    return "\n".join(lines)
