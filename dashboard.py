@@ -53,6 +53,20 @@ def build_dashboard_html(trades):
     table_rows = _rows_table(trades)
     total_r_class = "pos" if total_r >= 0 else "neg"
 
+    disciplined = [t for t in closed if t.get("idm_ok") is True and t.get("turtle_ok") is True]
+    undisciplined = [t for t in closed if not (t.get("idm_ok") is True and t.get("turtle_ok") is True)]
+
+    def _win_rate(lst):
+        if not lst:
+            return None
+        wins = sum(1 for t in lst if t["r_multiple"] > 0)
+        return wins / len(lst) * 100
+
+    disc_wr = _win_rate(disciplined)
+    undisc_wr = _win_rate(undisciplined)
+    disc_wr_text = f"{disc_wr:.1f}%" if disc_wr is not None else "-"
+    undisc_wr_text = f"{undisc_wr:.1f}%" if undisc_wr is not None else "-"
+
     return f"""<!DOCTYPE html>
 <html lang="th">
 <head>
@@ -93,6 +107,8 @@ def build_dashboard_html(trades):
     <div class="card"><div class="label">ชนะ / แพ้</div><div class="value">{wins} / {losses}</div></div>
     <div class="card"><div class="label">Max Drawdown</div><div class="value neg">{max_dd:.2f}R</div></div>
     <div class="card"><div class="label">ไม้เปิดอยู่</div><div class="value">{len(open_trades)}</div></div>
+    <div class="card"><div class="label">Win rate (ทำครบระบบ)</div><div class="value">{disc_wr_text}</div></div>
+    <div class="card"><div class="label">Win rate (ทำไม่ครบ)</div><div class="value">{undisc_wr_text}</div></div>
   </div>
 
   <div class="box">
