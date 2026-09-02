@@ -5,6 +5,7 @@ from flask import Flask, request, jsonify
 import requests
 import yfinance as yf
 
+from cot import build_cot_report, build_cot_weekly_digest
 from dashboard import build_dashboard_html
 from forex import build_forex_alert_message, build_symbol_report, resolve_forex_symbol
 from journal import close_trade, get_all_trades, get_open_trades_raw, get_stats, list_open_trades, log_trade
@@ -599,6 +600,17 @@ def alert_check():
     return jsonify(ok=True, triggered=len(messages))
 
 
+@app.route(f"/cot-check/{FOREX_CRON_SECRET}", methods=["GET", "POST"])
+def cot_check():
+    # CFTC publishes new COT data every Friday ~3:30pm ET — point a
+    # weekly cron job here (e.g. Saturday morning) to get the digest
+    # without asking for it.
+    if not FOREX_CHAT_ID:
+        return jsonify(ok=False, error="FOREX_CHAT_ID is not set"), 400
+    send_message(FOREX_CHAT_ID, build_cot_weekly_digest())
+    return jsonify(ok=True)
+
+
 @app.route(f"/webhook/{TELEGRAM_TOKEN}", methods=["POST"])
 def webhook():
     update = request.get_json(force=True, silent=True) or {}
@@ -706,7 +718,8 @@ def webhook():
             "/alerts — ดูแจ้งเตือนที่ตั้งไว้\n"
             "/unalert ID — ยกเลิกแจ้งเตือน\n\n"
             "<b>Macro:</b>\n"
-            "/macro — DXY, US 10Y Yield, SET Index แบบสรุปเร็ว\n\n"
+            "/macro — DXY, US 10Y Yield, SET Index แบบสรุปเร็ว\n"
+            "/cot [SYMBOL] — COT Report ตำแหน่งสถาบัน (default XAUUSD) เช่น /cot XAUUSD\n\n"
             "<b>คำนวณขนาดโพซิชัน:</b>\n"
             "/size SYMBOL ทุน RISK% ราคาเข้า SL\n"
             "เช่น /size XAUUSD 10000 1 2650 2620\n\n"
@@ -837,6 +850,12 @@ def webhook():
         send_message(chat_id, build_macro_report())
         return jsonify(ok=True)
 
+    if text.startswith("/cot"):
+        parts = text.split()
+        symbol = parts[1].upper() if len(parts) > 1 else "XAUUSD"
+        send_message(chat_id, build_cot_report(symbol))
+        return jsonify(ok=True)
+
     if text.startswith("/size"):
         parts = text.split()
         if len(parts) != 5:
@@ -912,6 +931,7 @@ def setup_bot_commands():
         {"command": "alerts", "description": "ดูแจ้งเตือนที่ตั้งไว้"},
         {"command": "unalert", "description": "ยกเลิกแจ้งเตือน"},
         {"command": "macro", "description": "ดู DXY / US10Y Yield / SET Index"},
+        {"command": "cot", "description": "COT Report ตำแหน่งสถาบัน (เช่น /cot XAUUSD)"},
         {"command": "size", "description": "คำนวณขนาดโพซิชัน"},
         {"command": "setlimit", "description": "ตั้งวงเงินขาดทุนสูงสุด (daily/weekly)"},
         {"command": "limits", "description": "เช็คสถานะวงเงินขาดทุน"},
