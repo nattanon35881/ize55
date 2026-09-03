@@ -6,8 +6,8 @@ logger = logging.getLogger(__name__)
 
 # Known symbol aliases -> yfinance ticker candidates to try, in order.
 SYMBOL_ALIASES = {
-    "XAUUSD": ["GC=F", "XAUUSD=X"],
-    "GOLD": ["GC=F", "XAUUSD=X"],
+    "XAUUSD": ["XAUUSD=X", "GC=F"],
+    "GOLD": ["XAUUSD=X", "GC=F"],
     "XAGUSD": ["SI=F", "XAGUSD=X"],
     "SILVER": ["SI=F", "XAGUSD=X"],
     "US100": ["^NDX", "NQ=F"],
