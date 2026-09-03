@@ -10,6 +10,7 @@ from dashboard import build_dashboard_html
 from forex import build_forex_alert_message, build_symbol_report, resolve_forex_symbol
 from journal import close_trade, get_all_trades, get_open_trades_raw, get_stats, list_open_trades, log_trade
 from macro import build_macro_dashboard_html, build_macro_report
+from qt import build_qt_report
 from risk import (
     build_limits_status,
     check_trading_allowed,
@@ -719,7 +720,8 @@ def webhook():
             "/unalert ID — ยกเลิกแจ้งเตือน\n\n"
             "<b>Macro:</b>\n"
             "/macro — DXY, US 10Y Yield, SET Index แบบสรุปเร็ว\n"
-            "/cot [SYMBOL] — COT Report ตำแหน่งสถาบัน (default XAUUSD) เช่น /cot XAUUSD\n\n"
+            "/cot [SYMBOL] — COT Report ตำแหน่งสถาบัน (default XAUUSD) เช่น /cot XAUUSD\n"
+            "/qt — TDO Bias + โมเดล AMDX/XAMD ของทอง (Quarterly Theory)\n\n"
             "<b>คำนวณขนาดโพซิชัน:</b>\n"
             "/size SYMBOL ทุน RISK% ราคาเข้า SL\n"
             "เช่น /size XAUUSD 10000 1 2650 2620\n\n"
@@ -856,6 +858,10 @@ def webhook():
         send_message(chat_id, build_cot_report(symbol))
         return jsonify(ok=True)
 
+    if text.startswith("/qt"):
+        send_message(chat_id, build_qt_report())
+        return jsonify(ok=True)
+
     if text.startswith("/size"):
         parts = text.split()
         if len(parts) != 5:
@@ -932,6 +938,7 @@ def setup_bot_commands():
         {"command": "unalert", "description": "ยกเลิกแจ้งเตือน"},
         {"command": "macro", "description": "ดู DXY / US10Y Yield / SET Index"},
         {"command": "cot", "description": "COT Report ตำแหน่งสถาบัน (เช่น /cot XAUUSD)"},
+        {"command": "qt", "description": "TDO Bias + โมเดล AMDX/XAMD (Quarterly Theory)"},
         {"command": "size", "description": "คำนวณขนาดโพซิชัน"},
         {"command": "setlimit", "description": "ตั้งวงเงินขาดทุนสูงสุด (daily/weekly)"},
         {"command": "limits", "description": "เช็คสถานะวงเงินขาดทุน"},
