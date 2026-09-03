@@ -10,7 +10,7 @@ logger = logging.getLogger(__name__)
 NY_TZ = ZoneInfo("America/New_York")
 BKK_TZ = ZoneInfo("Asia/Bangkok")
 
-GOLD_TICKER_CANDIDATES = ["GC=F", "XAUUSD=X"]
+GOLD_TICKER_CANDIDATES = ["XAUUSD=X", "GC=F"]
 
 BOX_MINUTES_BEFORE_TDO = 90  # the "blue box" = 90 min immediately before TDO
 
