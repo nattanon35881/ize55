@@ -12,7 +12,11 @@ BKK_TZ = ZoneInfo("Asia/Bangkok")
 
 GOLD_TICKER_CANDIDATES = ["XAUUSD=X", "GC=F"]
 
-BOX_MINUTES_BEFORE_TDO = 90  # the "blue box" = 90 min immediately before TDO
+# The 5 daily check times (Thai wall-clock, fixed — same as the existing
+# forex-check cron schedule). The box for a given check = the price range
+# from the PREVIOUS one of these times up to this one; AMDX/XAMD is read
+# off wherever the latest candle sits relative to that box at check time.
+ALERT_TIMES_BKK = [(8, 0), (12, 30), (14, 0), (18, 30), (20, 0)]
 
 
 def _get_gold_m1():
@@ -48,21 +52,13 @@ def _get_gold_m1():
     return None, None
 
 
-def get_tdo_and_box():
+def get_tdo_bias():
     """TDO (True Day Open) = the open price at New York midnight, computed
     from actual NY time (not a fixed Thai clock hour) so it keeps working
     across US daylight saving changes — it lands on 11:00 Thai time
-    during EDT (roughly Mar-Nov) and 12:00 during EST.
-
-    The 'box' the user reads on the chart is the high/low of the 90
-    minutes immediately before TDO (22:30-00:00 NY time). AMDX/XAMD is
-    read off where the LATEST candle sits relative to that box at the
-    moment of checking — not whether price ever poked outside it earlier
-    in the session. A mid-session breakout that has since reverted back
-    inside the box does not count as XAMD; only the current position does.
-    This is meant to be read right at each session-boundary check time
-    (the same 8:00/12:30/14:00/18:30/20:00 alert times), which is exactly
-    when this function gets called.
+    during EDT (roughly Mar-Nov) and 12:00 during EST. Bias = BUY if the
+    current price is below TDO, SELL if above. This is independent of
+    the alert-interval box/model below.
     """
     symbol, hist = _get_gold_m1()
     if hist is None:
@@ -70,82 +66,131 @@ def get_tdo_and_box():
 
     now_ny = datetime.now(NY_TZ)
     tdo_time = now_ny.replace(hour=0, minute=0, second=0, microsecond=0)
-    box_start = tdo_time - timedelta(minutes=BOX_MINUTES_BEFORE_TDO)
+    today_session = hist[hist.index >= tdo_time]
 
-    box_window = hist[(hist.index >= box_start) & (hist.index < tdo_time)]
-    session_window = hist[hist.index >= tdo_time]
+    if today_session.empty:
+        return {"symbol": symbol, "current_price": float(hist["Close"].iloc[-1]),
+                "tdo_price": None, "tdo_time_ny": tdo_time, "bias": None}
 
-    if box_window.empty:
-        return None
-
-    box_high = float(box_window["High"].max())
-    box_low = float(box_window["Low"].min())
-
-    tdo_price = float(session_window["Open"].iloc[0]) if not session_window.empty else None
+    tdo_price = float(today_session["Open"].iloc[0])
     current_price = float(hist["Close"].iloc[-1])
-
-    model = None
-    breakout_direction = None
-    if not session_window.empty:
-        if current_price > box_high:
-            model = "XAMD"
-            breakout_direction = "ขึ้น"
-        elif current_price < box_low:
-            model = "XAMD"
-            breakout_direction = "ลง"
-        else:
-            model = "AMDX"
-
-    bias = None
-    if tdo_price is not None:
-        bias = "BUY (ราคาต่ำกว่า TDO)" if current_price < tdo_price else "SELL (ราคาสูงกว่า TDO)"
+    bias = "BUY (ราคาต่ำกว่า TDO)" if current_price < tdo_price else "SELL (ราคาสูงกว่า TDO)"
 
     return {
         "symbol": symbol,
         "current_price": current_price,
         "tdo_price": tdo_price,
         "tdo_time_ny": tdo_time,
+        "bias": bias,
+    }
+
+
+def _alert_boundaries_bkk(now_bkk):
+    """All 5-daily-alert-time instants spanning the day before/after `now`,
+    sorted chronologically, as tz-aware Bangkok datetimes."""
+    candidates = []
+    for day_offset in (-1, 0, 1):
+        day = (now_bkk + timedelta(days=day_offset)).date()
+        for h, m in ALERT_TIMES_BKK:
+            candidates.append(datetime(day.year, day.month, day.day, h, m, tzinfo=BKK_TZ))
+    candidates.sort()
+    return candidates
+
+
+def get_alert_box_model(hist):
+    """The box resets fresh at every one of the 5 daily alert times: box =
+    high/low of the interval from the PREVIOUS alert time to the CURRENT
+    one. AMDX/XAMD is read off the latest available candle's position
+    relative to that box, checked right at (or just before) each alert
+    time — not any breakout earlier in the interval that may have since
+    reverted.
+    """
+    now_bkk = datetime.now(BKK_TZ)
+    boundaries = _alert_boundaries_bkk(now_bkk)
+
+    current_boundary = None
+    previous_boundary = None
+    for i, b in enumerate(boundaries):
+        if b <= now_bkk:
+            current_boundary = b
+            previous_boundary = boundaries[i - 1] if i > 0 else None
+
+    if current_boundary is None or previous_boundary is None:
+        return None
+
+    hist_bkk = hist.tz_convert(BKK_TZ)
+    box_window = hist_bkk[(hist_bkk.index >= previous_boundary) & (hist_bkk.index < current_boundary)]
+    if box_window.empty:
+        return None
+
+    box_high = float(box_window["High"].max())
+    box_low = float(box_window["Low"].min())
+    current_price = float(hist_bkk["Close"].iloc[-1])
+
+    if current_price > box_high:
+        model, direction = "XAMD", "ขึ้น"
+    elif current_price < box_low:
+        model, direction = "XAMD", "ลง"
+    else:
+        model, direction = "AMDX", None
+
+    return {
         "box_high": box_high,
         "box_low": box_low,
-        "bias": bias,
+        "box_start_bkk": previous_boundary,
+        "box_end_bkk": current_boundary,
         "model": model,
-        "breakout_direction": breakout_direction,
+        "breakout_direction": direction,
     }
 
 
 def build_qt_report():
     try:
-        data = get_tdo_and_box()
+        symbol, hist = _get_gold_m1()
     except Exception:
-        logger.exception("get_tdo_and_box failed")
-        data = None
+        logger.exception("_get_gold_m1 failed")
+        symbol, hist = None, None
 
-    if not data:
-        return (
-            "⚠️ ดึงข้อมูล TDO/กรอบราคาไม่ได้ตอนนี้ครับ "
-            "(อาจยังไม่ถึงช่วงที่มีข้อมูลของกรอบก่อนหน้า หรือ Yahoo มีปัญหาชั่วคราว)"
-        )
+    if hist is None:
+        return "⚠️ ดึงข้อมูลราคาทองไม่ได้ตอนนี้ครับ (Twelve Data/Yahoo อาจมีปัญหาชั่วคราว)"
 
-    tdo_time_bkk = data["tdo_time_ny"].astimezone(BKK_TZ)
+    try:
+        tdo_data = get_tdo_bias()
+    except Exception:
+        logger.exception("get_tdo_bias failed")
+        tdo_data = None
+
+    try:
+        box_data = get_alert_box_model(hist)
+    except Exception:
+        logger.exception("get_alert_box_model failed")
+        box_data = None
+
+    current_price = float(hist["Close"].iloc[-1])
     lines = [
         "🕐 <b>Quarterly Theory — XAUUSD</b>",
-        f"ราคาปัจจุบัน: {data['current_price']:,.2f}",
+        f"ราคาปัจจุบัน: {current_price:,.2f}",
     ]
-    if data["tdo_price"] is not None:
-        lines.append(f"TDO ({tdo_time_bkk.strftime('%H:%M')} น. ไทย): {data['tdo_price']:,.2f}")
+
+    if tdo_data and tdo_data.get("tdo_price") is not None:
+        tdo_time_bkk = tdo_data["tdo_time_ny"].astimezone(BKK_TZ)
+        lines.append(f"TDO ({tdo_time_bkk.strftime('%H:%M')} น. ไทย): {tdo_data['tdo_price']:,.2f}")
+        lines.append(f"📊 Bias วันนี้: {tdo_data['bias']}")
     else:
         lines.append("TDO: ยังไม่เริ่ม session ใหม่วันนี้")
 
-    if data["bias"]:
-        lines.append(f"📊 Bias วันนี้: {data['bias']}")
-
-    lines.append(f"กรอบก่อนหน้า (box): {data['box_low']:,.2f} - {data['box_high']:,.2f}")
-
-    if data["model"] == "AMDX":
-        lines.append("🟦 โมเดล: <b>AMDX</b> — ตอนนี้ราคายังอยู่ในกรอบก่อนหน้า")
-    elif data["model"] == "XAMD":
-        lines.append(f"🟥 โมเดล: <b>XAMD</b> — ตอนนี้ราคาทะลุกรอบไปทาง{data['breakout_direction']}แล้ว")
+    if box_data:
+        start_str = box_data["box_start_bkk"].strftime("%H:%M")
+        end_str = box_data["box_end_bkk"].strftime("%H:%M")
+        lines.append(
+            f"\nกรอบรอบนี้ ({start_str}-{end_str} น.): "
+            f"{box_data['box_low']:,.2f} - {box_data['box_high']:,.2f}"
+        )
+        if box_data["model"] == "AMDX":
+            lines.append("🟦 โมเดล: <b>AMDX</b> — ตอนนี้ราคายังอยู่ในกรอบรอบนี้")
+        else:
+            lines.append(f"🟥 โมเดล: <b>XAMD</b> — ตอนนี้ราคาทะลุกรอบไปทาง{box_data['breakout_direction']}แล้ว")
     else:
-        lines.append("โมเดล: รอถึง TDO ก่อนถึงจะจำแนกได้")
+        lines.append("\nกรอบรอบนี้: ดึงข้อมูลไม่พอสำหรับช่วงเวลานี้")
 
     return "\n".join(lines)
