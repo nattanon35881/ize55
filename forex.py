@@ -117,6 +117,20 @@ CHECKLIST = (
 )
 
 
+def _twelvedata_symbol(display_symbol):
+    """Map our bot's display symbol to Twelve Data's format ('XAU/USD',
+    'EUR/USD', ...). Returns None for symbols we don't have a mapping
+    for (caller keeps using the yfinance price in that case)."""
+    s = display_symbol.strip().upper()
+    if s in ("XAUUSD", "GOLD"):
+        return "XAU/USD"
+    if s in ("XAGUSD", "SILVER"):
+        return "XAG/USD"
+    if len(s) == 6 and s.isalpha():
+        return f"{s[:3]}/{s[3:]}"
+    return None
+
+
 def _build_report(display_symbol, title):
     candidates = resolve_forex_symbol(display_symbol)
     if not candidates:
@@ -133,6 +147,21 @@ def _build_report(display_symbol, title):
             f"⚠️ ดึงข้อมูลราคา {display_symbol} ไม่ได้ตอนนี้ "
             "ลองเปิดชาร์ตเช็คด้วยตัวเองก่อนนะครับ"
         )
+
+    # The swing/Fibonacci structure stays on yfinance (delay doesn't matter
+    # for that). Only the live price — and the bias comparison against it
+    # — gets swapped for a real-time Twelve Data quote when configured,
+    # since that's what "matches TradingView" actually needs.
+    td_symbol = _twelvedata_symbol(display_symbol)
+    if td_symbol:
+        try:
+            from price_feed import get_realtime_price
+            fresh_price = get_realtime_price(td_symbol)
+        except Exception:
+            fresh_price = None
+        if fresh_price:
+            data["price"] = fresh_price
+            data["bias"] = "SELL (โซนแพง)" if fresh_price > data["fib_50"] else "BUY (โซนถูก)"
 
     lines = [
         f"<b>{title} — {display_symbol}</b>",
