@@ -2,6 +2,7 @@ import logging
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
+import pandas as pd
 import yfinance as yf
 
 logger = logging.getLogger(__name__)
@@ -15,9 +16,26 @@ BOX_MINUTES_BEFORE_TDO = 90  # the "blue box" = 90 min immediately before TDO
 
 
 def _get_gold_m1():
-    """Fetch recent 1-minute gold candles. Yahoo only keeps 1m data for
-    about the last 7 days, which is plenty since we only need today's
-    session."""
+    """Fetch recent 1-minute gold candles — real-time via Twelve Data when
+    an API key is configured (matches what you see on TradingView),
+    falling back to Yahoo Finance (which can run a few minutes behind)
+    otherwise. AMDX/XAMD hinges on exactly where the latest candle sits,
+    so this is the one place real-time data matters most.
+    """
+    try:
+        from price_feed import get_realtime_1m_series
+        candles = get_realtime_1m_series("XAU/USD")
+    except Exception:
+        candles = None
+
+    if candles:
+        df = pd.DataFrame(candles)
+        df["datetime"] = pd.to_datetime(df["datetime"]).dt.tz_localize("UTC")
+        df = df.set_index("datetime").rename(
+            columns={"open": "Open", "high": "High", "low": "Low", "close": "Close"}
+        )
+        return "XAU/USD (Twelve Data)", df.tz_convert(NY_TZ)
+
     for symbol in GOLD_TICKER_CANDIDATES:
         try:
             hist = yf.Ticker(symbol).history(period="2d", interval="1m")
