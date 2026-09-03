@@ -150,9 +150,16 @@ def _build_report(display_symbol, title):
 
 def build_forex_alert_message(display_symbol="XAUUSD"):
     """Scheduled alert (used by the /forex-check cron route)."""
-    return _build_report(display_symbol, "🔔 เช็คระบบ ize (ตามเวลา)") or (
+    report = _build_report(display_symbol, "🔔 เช็คระบบ ize (ตามเวลา)") or (
         f"⚠️ ดึงข้อมูลราคา {display_symbol} ไม่ได้ตอนนี้"
     )
+    if display_symbol.strip().upper() in ("XAUUSD", "GOLD"):
+        try:
+            from qt import build_qt_report
+            report = f"{report}\n\n{build_qt_report()}"
+        except Exception:
+            logger.exception("build_qt_report failed in scheduled alert")
+    return report
 
 
 def build_symbol_report(raw_symbol):
