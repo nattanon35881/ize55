@@ -12,11 +12,12 @@ BKK_TZ = ZoneInfo("Asia/Bangkok")
 
 GOLD_TICKER_CANDIDATES = ["XAUUSD=X", "GC=F"]
 
-# The 5 daily check times (Thai wall-clock, fixed — same as the existing
-# forex-check cron schedule). The box for a given check = the price range
-# from the PREVIOUS one of these times up to this one; AMDX/XAMD is read
-# off wherever the latest candle sits relative to that box at check time.
-ALERT_TIMES_BKK = [(8, 0), (12, 30), (14, 0), (18, 30), (20, 0)]
+BOX_MINUTES_BEFORE_TDO = 90  # the fixed pre-TDO box duration (9:30-11:00 style)
+
+# The boundaries used to build each day's box sequence: 4 fixed Thai
+# clock times, plus TDO (dynamic — see get_tdo_bias). Chronological
+# order within a day: 8:00, TDO(~11:00/12:00), 12:30, 14:00, 18:30, 20:00.
+FIXED_TIMES_BKK = [("0800", 8, 0), ("1230", 12, 30), ("1400", 14, 0), ("1830", 18, 30), ("2000", 20, 0)]
 
 
 def _get_gold_m1():
@@ -52,14 +53,18 @@ def _get_gold_m1():
     return None, None
 
 
+def _tdo_bkk_for(ny_date):
+    """TDO (NY midnight) for a given NY calendar date, as a Bangkok-aware
+    datetime. Anchored to real NY time so it keeps working across US
+    daylight saving changes."""
+    tdo_ny = datetime(ny_date.year, ny_date.month, ny_date.day, 0, 0, tzinfo=NY_TZ)
+    return tdo_ny.astimezone(BKK_TZ)
+
+
 def get_tdo_bias():
-    """TDO (True Day Open) = the open price at New York midnight, computed
-    from actual NY time (not a fixed Thai clock hour) so it keeps working
-    across US daylight saving changes — it lands on 11:00 Thai time
-    during EDT (roughly Mar-Nov) and 12:00 during EST. Bias = BUY if the
-    current price is below TDO, SELL if above. This is independent of
-    the alert-interval box/model below.
-    """
+    """Bias = BUY if the current price is below today's TDO (True Day
+    Open, = NY midnight open), SELL if above. Independent of the
+    alert-interval box/model below."""
     symbol, hist = _get_gold_m1()
     if hist is None:
         return None
@@ -85,41 +90,58 @@ def get_tdo_bias():
     }
 
 
-def _alert_boundaries_bkk(now_bkk):
-    """All 5-daily-alert-time instants spanning the day before/after `now`,
-    sorted chronologically, as tz-aware Bangkok datetimes."""
-    candidates = []
-    for day_offset in (-1, 0, 1):
-        day = (now_bkk + timedelta(days=day_offset)).date()
-        for h, m in ALERT_TIMES_BKK:
-            candidates.append(datetime(day.year, day.month, day.day, h, m, tzinfo=BKK_TZ))
-    candidates.sort()
-    return candidates
+def _day_boundaries_bkk(ny_date):
+    """(label, datetime_bkk) pairs for one NY calendar date's boundaries,
+    chronological: 8:00, TDO, 12:30, 14:00, 18:30, 20:00 (Bangkok time)."""
+    tdo_bkk = _tdo_bkk_for(ny_date)
+    bkk_date = tdo_bkk.date()
+
+    def t(h, m):
+        return datetime(bkk_date.year, bkk_date.month, bkk_date.day, h, m, tzinfo=BKK_TZ)
+
+    points = [("0800", t(8, 0)), ("TDO", tdo_bkk)]
+    points += [(label, t(h, m)) for label, h, m in FIXED_TIMES_BKK if label != "0800"]
+    points.sort(key=lambda p: p[1])
+    return points
+
+
+def _all_boundaries_bkk(now_bkk):
+    now_ny = now_bkk.astimezone(NY_TZ)
+    points = []
+    for offset in (-2, -1, 0, 1, 2):
+        points.extend(_day_boundaries_bkk((now_ny.date() + timedelta(days=offset))))
+    return sorted(set(points), key=lambda p: p[1])
 
 
 def get_alert_box_model(hist):
-    """The box resets fresh at every one of the 5 daily alert times: box =
-    high/low of the interval from the PREVIOUS alert time to the CURRENT
-    one. AMDX/XAMD is read off the latest available candle's position
-    relative to that box, checked right at (or just before) each alert
-    time — not any breakout earlier in the interval that may have since
-    reverted.
+    """The box for each check is the interval that had ALREADY completed
+    one step before the current check — not the interval ending at the
+    check itself (comparing a candle to the box it's part of is
+    meaningless). E.g. checking at 14:00 compares against the TDO-12:30
+    box, not the 12:30-14:00 box. The one exception is the very first
+    check after TDO (at 12:30), which uses the fixed 90-minute pre-TDO
+    window instead of the (much wider) 8:00-TDO gap, matching the chart.
+    AMDX/XAMD is read off the latest candle's position relative to that
+    reference box.
     """
     now_bkk = datetime.now(BKK_TZ)
-    boundaries = _alert_boundaries_bkk(now_bkk)
+    boundaries = _all_boundaries_bkk(now_bkk)
 
-    current_boundary = None
-    previous_boundary = None
-    for i, b in enumerate(boundaries):
-        if b <= now_bkk:
-            current_boundary = b
-            previous_boundary = boundaries[i - 1] if i > 0 else None
-
-    if current_boundary is None or previous_boundary is None:
+    idx = None
+    for i, (_, t) in enumerate(boundaries):
+        if t <= now_bkk:
+            idx = i
+    if idx is None or idx < 2:
         return None
 
+    box_start_label, box_start = boundaries[idx - 2]
+    box_end_label, box_end = boundaries[idx - 1]
+
+    if box_end_label == "TDO":
+        box_start = box_end - timedelta(minutes=BOX_MINUTES_BEFORE_TDO)
+
     hist_bkk = hist.tz_convert(BKK_TZ)
-    box_window = hist_bkk[(hist_bkk.index >= previous_boundary) & (hist_bkk.index < current_boundary)]
+    box_window = hist_bkk[(hist_bkk.index >= box_start) & (hist_bkk.index < box_end)]
     if box_window.empty:
         return None
 
@@ -137,8 +159,8 @@ def get_alert_box_model(hist):
     return {
         "box_high": box_high,
         "box_low": box_low,
-        "box_start_bkk": previous_boundary,
-        "box_end_bkk": current_boundary,
+        "box_start_bkk": box_start,
+        "box_end_bkk": box_end,
         "model": model,
         "breakout_direction": direction,
     }
@@ -183,14 +205,14 @@ def build_qt_report():
         start_str = box_data["box_start_bkk"].strftime("%H:%M")
         end_str = box_data["box_end_bkk"].strftime("%H:%M")
         lines.append(
-            f"\nกรอบรอบนี้ ({start_str}-{end_str} น.): "
+            f"\nกรอบอ้างอิง ({start_str}-{end_str} น.): "
             f"{box_data['box_low']:,.2f} - {box_data['box_high']:,.2f}"
         )
         if box_data["model"] == "AMDX":
-            lines.append("🟦 โมเดล: <b>AMDX</b> — ตอนนี้ราคายังอยู่ในกรอบรอบนี้")
+            lines.append("🟦 โมเดล: <b>AMDX</b> — ตอนนี้ราคายังอยู่ในกรอบ")
         else:
             lines.append(f"🟥 โมเดล: <b>XAMD</b> — ตอนนี้ราคาทะลุกรอบไปทาง{box_data['breakout_direction']}แล้ว")
     else:
-        lines.append("\nกรอบรอบนี้: ดึงข้อมูลไม่พอสำหรับช่วงเวลานี้")
+        lines.append("\nกรอบอ้างอิง: ดึงข้อมูลไม่พอสำหรับช่วงเวลานี้")
 
     return "\n".join(lines)
