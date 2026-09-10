@@ -20,6 +20,20 @@ def _call_sheet(payload):
         return None
 
 
+def _price_from_history(ticker):
+    """Same last-resort fallback as the main stock lookup — see app.py's
+    resolve_ticker for the full explanation."""
+    try:
+        hist = ticker.history(period="5d", interval="1d")
+    except Exception:
+        return None, None
+    if hist is None or hist.empty:
+        return None, None
+    price = float(hist["Close"].iloc[-1])
+    prev_close = float(hist["Close"].iloc[-2]) if len(hist) > 1 else None
+    return price, prev_close
+
+
 def get_price(symbol):
     """Current price + % change for a stock symbol. Price comes from
     Twelve Data first (Yahoo Finance blocks cloud-server IPs from its
@@ -48,19 +62,30 @@ def get_price(symbol):
         candidates.append(f"{symbol}.BK")
 
     for candidate in candidates:
+        ticker_obj = yf.Ticker(candidate)
         try:
-            info = yf.Ticker(candidate).info or {}
+            info = ticker_obj.info or {}
         except Exception:
             info = {}
+
         price = td_price or info.get("currentPrice") or info.get("regularMarketPrice")
+
+        if not price:
+            hist_price, hist_prev_close = _price_from_history(ticker_obj)
+            if hist_price:
+                price = hist_price
+                info = dict(info)
+                info.setdefault("previousClose", hist_prev_close)
+
         if price:
             prev_close = info.get("previousClose")
             change_pct = ((price - prev_close) / prev_close) if prev_close else None
+            currency = info.get("currency") or ("THB" if candidate.endswith(".BK") else "")
             return {
                 "symbol": candidate,
                 "price": price,
                 "change_pct": change_pct,
-                "currency": info.get("currency", ""),
+                "currency": currency,
             }
     return None
 
