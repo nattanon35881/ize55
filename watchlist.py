@@ -21,19 +21,38 @@ def _call_sheet(payload):
 
 
 def get_price(symbol):
-    """Current price + % change for a stock symbol (tries the symbol as
-    typed, then with a .BK suffix for Thai/SET stocks — same approach as
-    the main stock lookup)."""
+    """Current price + % change for a stock symbol. Price comes from
+    Twelve Data first (Yahoo Finance blocks cloud-server IPs from its
+    price API with 401 errors), falling back to yfinance if Twelve Data
+    has no data for the symbol — tries the symbol as typed, then with a
+    .BK suffix for Thai/SET stocks on the yfinance side."""
+    symbol = symbol.strip().upper()
+
+    try:
+        from price_feed import get_realtime_price
+    except Exception:
+        get_realtime_price = None
+
+    td_price = None
+    if get_realtime_price:
+        for td_symbol in (symbol, f"{symbol}:SET"):
+            try:
+                td_price = get_realtime_price(td_symbol)
+            except Exception:
+                td_price = None
+            if td_price:
+                break
+
     candidates = [symbol]
     if "." not in symbol:
         candidates.append(f"{symbol}.BK")
 
     for candidate in candidates:
         try:
-            info = yf.Ticker(candidate).info
+            info = yf.Ticker(candidate).info or {}
         except Exception:
-            continue
-        price = info.get("currentPrice") or info.get("regularMarketPrice")
+            info = {}
+        price = td_price or info.get("currentPrice") or info.get("regularMarketPrice")
         if price:
             prev_close = info.get("previousClose")
             change_pct = ((price - prev_close) / prev_close) if prev_close else None
