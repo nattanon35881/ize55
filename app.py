@@ -241,6 +241,25 @@ def fmt_pct(value, digits=2):
         return str(value)
 
 
+def _price_from_history(ticker):
+    """Last-resort price fallback: the latest close from yfinance's
+    chart/history endpoint, which has so far stayed more available than
+    the quoteSummary endpoint behind .info (the one Yahoo has been
+    blocking with 401 "Invalid Crumb" errors) — this matters most for
+    Thai SET stocks, since Twelve Data only covers that exchange on a
+    paid plan. Returns (price, prev_close) or (None, None).
+    """
+    try:
+        hist = ticker.history(period="5d", interval="1d")
+    except Exception:
+        return None, None
+    if hist is None or hist.empty:
+        return None, None
+    price = float(hist["Close"].iloc[-1])
+    prev_close = float(hist["Close"].iloc[-2]) if len(hist) > 1 else None
+    return price, prev_close
+
+
 def resolve_ticker(raw_symbol):
     """Try the symbol as typed, then with a .BK suffix (Yahoo's own Thai/
     SET convention). Price comes from Twelve Data first — Yahoo Finance
@@ -284,7 +303,18 @@ def resolve_ticker(raw_symbol):
             info = {}
 
         price = td_price or info.get("currentPrice") or info.get("regularMarketPrice")
+
+        if not price:
+            hist_price, hist_prev_close = _price_from_history(t)
+            if hist_price:
+                price = hist_price
+                info = dict(info)
+                info.setdefault("previousClose", hist_prev_close)
+
         if price:
+            if candidate.endswith(".BK"):
+                info = dict(info)
+                info.setdefault("currency", "THB")
             return t, candidate, info, price
 
     return None, None, None, None
