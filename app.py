@@ -7,6 +7,7 @@ import yfinance as yf
 
 from cot import build_cot_report, build_cot_weekly_digest
 from dashboard import build_dashboard_html
+from mac_bridge import MacCashflowProxy, get_fundamentals_from_mac
 from forex import build_forex_alert_message, build_symbol_report, resolve_forex_symbol
 from journal import close_trade, get_all_trades, get_open_trades_raw, get_stats, list_open_trades, log_trade
 from macro import build_macro_dashboard_html, build_macro_report
@@ -526,6 +527,23 @@ def build_report(raw_symbol):
     if price and prev_close:
         change_pct = (price - prev_close) / prev_close
 
+    # Yahoo blocks yfinance's .info from Render's cloud IP, so if that
+    # came back empty, ask the Mac bridge — same yfinance call, but made
+    # from a home IP that Yahoo isn't blocking. dcf_ticker gets swapped
+    # to a lightweight proxy so compute_dcf_value's existing
+    # ticker.cashflow usage keeps working unchanged.
+    dcf_ticker = ticker
+    if not info.get("trailingPE") and not info.get("longName"):
+        mac_info, mac_cashflow, mac_symbol = get_fundamentals_from_mac(resolved)
+        if mac_info:
+            info = mac_info
+            dcf_ticker = MacCashflowProxy(mac_cashflow)
+            name = info.get("longName") or info.get("shortName") or resolved
+            currency = info.get("currency", currency)
+            prev_close = info.get("previousClose", prev_close)
+            if price and prev_close:
+                change_pct = (price - prev_close) / prev_close
+
     lines = [f"<b>{name} ({resolved})</b>"]
 
     price_line = f"ราคา: {fmt_num(price)} {currency}".strip()
@@ -573,7 +591,7 @@ def build_report(raw_symbol):
 
     dcf_result = None
     try:
-        dcf_result = compute_dcf_value(ticker, info)
+        dcf_result = compute_dcf_value(dcf_ticker, info)
     except Exception:
         logger.exception("DCF calculation failed for %s", resolved)
 
